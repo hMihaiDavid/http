@@ -18,8 +18,10 @@
 #if defined(DEBUG)
  #define DEBUG_PRINT(fmt, args...) fprintf(stderr, "DEBUG: %s:%d:%s(): " fmt, \
              __FILE__, __LINE__, __func__, ##args)
+ #define DEBUG_PRINT_RAW(fmt, args...) fprintf(stderr, fmt, ##args)
 #else
  #define DEBUG_PRINT(fmt, args...) /* Don't do anything in release builds */
+ #define DEBUG_PRINT_RAW(fmt, args...)
 #endif
 
 
@@ -43,15 +45,18 @@
  * */
 struct connection {
     int sock;
+    struct epol_event *ev;
+
     enum {
-        RECV_REQUEST,
-        SEND_HEADER,
-        SEND_REPLY,
-        DONE
+        STATE_INVALID,
+        STATE_RECV,
+        STATE_SEND_HEADER,
+        STATE_SEND_REPLY,
+        STATE_DONE
     } state;
 
-    char request;
-    size_t request_length;
+    char *input_buffer; /* Buffer when we store input data before processing headers */
+    size_t input_len;    /* data read into request buffer */
 
 };
 
@@ -60,7 +65,7 @@ static int sockserv;    /* Server socket we accept connections from. */
 static int epoll_set;   /* fd of the epoll set used for i/o multiplexing. */
 static volatile int running = 1; /* Volatile so there's no problem in signal handler*/
 static FILE *logfile = NULL; /* Log to console by default*/;
-static size_t nopen_connections = 0;
+static size_t open_connections = 0;
 //static size_T nbytes_served;
 
 
@@ -74,6 +79,10 @@ static int sockserv_backlog = -1; /* somaxconn */
 static void err(int errcode, char *errmsg) {
     fprintf(stderr, "Error: %s\n", errmsg);
     exit(errcode);
+}
+
+static void xerr(int errcode, char *errmsg, int errno) {
+    // TODO
 }
 
 /*
@@ -159,11 +168,22 @@ static void parse_cmdline(int argc, const char **argv) {
  * Allocate a new connection object and initialize it
  * to default values.
  * */
-struct connection* connection_new() {
+static struct connection* connection_new() {
     struct connection *conn = (struct connection *) xmalloc(
             sizeof(struct connection));
-    
+    conn->sock = -1;
+    conn->ev = NULL;
+    conn->state = STATE_RECV;
+    conn->input_buffer = NULL;
+    conn->input_len = 0;
+    return conn;    
 
+}
+
+static void connection_free(struct connection *conn) {
+    free(conn->input_buffer);
+    free(conn->ev);
+    free(conn);   
 }
 
 /* Sets the O_NONBLOCK flag on a file descriptor. 
@@ -227,12 +247,115 @@ static void epoll_init(void) {
         err(1, "epoll() EPOLL_CTL_ADD server socket.");
 }
 
+static struct connection *accept_connection() {
+    int socket; /* client socket */
+    struct sockaddr_in client_addr;
+    size_t client_addr_len;
+    struct connection *conn;
+    struct epoll_event *ev;
+
+    socket = accept(sockserv, (struct sockaddr *) &client_addr, &client_addr_len);
+    if(socket == -1) {
+        if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return;
+            DEBUG_PRINT_RAW(".");
+        } else {
+            perror("accept()");
+            err(1, "accept()");
+        }
+    }
+    set_nonblocking(socket);
+    conn = connection_new();
+    conn->sock = socket;
+    
+    /* add the newly accepted connection to the epoll interest set */
+    ev = (struct epoll_event*)xmalloc(sizeof(struct epoll_event));
+    ev->events = EPOLLIN; /* Since conn->state is RECV_REPLY we are only interested in input events by now. */
+    ev->data.ptr = (void*)conn; /* so that we can identify the connection when we receive an event */
+    conn->ev = ev; /* we store it here so we can free() it when the connection is destroyed */
+
+    if(epoll_ctl(epoll_set, EPOLL_CTL_ADD, socket, ev) == -1)
+        err(1,"epoll_ctl(client socket)");
+    
+    open_connections++;   
+    return conn;
+}
+
+static void destroy_connection(struct connection *conn) {
+    close(conn->sock); /* by closing the socket...*/
+    connection_free(conn);
+    open_connections--;
+}
+
+/* All data has been read, now it's time to process it 
+ * and construct the response, then go to STATE_SEND_HEADER state
+ * to inform the event to to start sending data.
+ * */
+static void process_request(struct connection *conn) {
+    // for now, destroy connection.
+    conn->state = STATE_DONE;
+}
+
+/*
+ * epoll() told us there is input available  
+ * When we get EOF (connection closed by peer or error )
+ * or MAX_HTTP_REQUEST_LEN is exceeded there is no more to read.
+ * We can then process the request.
+ * */
+static void epoll_read(struct connection *conn) {
+    
+    // test version
+    ssize_t nread;
+    
+    // In first call allocate memory for input buffer.
+    if(conn->input_buffer == NULL) conn->input_buffer = xmalloc(1024);
+    nread = read(conn->sock, conn->input_buffer, 1024);
+    if(nread == -1) {
+        if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            // TODO: Research the EINTR error.
+            return; // no proble, we'll come back for next event.
+        }
+    } else if(nread == 0) {
+        // EOF reached: for socket : peer has closed connection.
+        // TODO: read on linux programming interface book about read() on a
+        // socket
+        DEBUG_PRINT_RAW("%s", conn->input_buffer);
+        process_request(conn);
+    } else {
+        /* Read some data */
+        conn->input_len += nread;
+    }
+    // TODO: after we process request? say to epoll
+    // we are interested in write available events and 
+    // change state so that we can write answer.
+}
+
+static void handle_io_event(struct connection *conn) {
+   switch(conn->state) {
+        case STATE_RECV:
+            epoll_read(conn);
+            break;
+        case STATE_SEND_HEADER:
+           
+           break;
+        case STATE_SEND_REPLY:
+           
+           break;
+        case STATE_DONE:
+        case STATE_INVALID:
+            destroy_connection(conn);
+           break;
+
+   }
+}
+
 /* 
  * Event loop
  * */
 static void httpd_epoll(void){
     int nfds_ready;
     struct epoll_event evlist[MAX_EVENTS];
+    struct connection *conn;
 
     nfds_ready = epoll_wait(epoll_set, evlist, MAX_EVENTS, -1);
 
@@ -242,7 +365,16 @@ static void httpd_epoll(void){
     }
 
     for(size_t i=0; i<nfds_ready; i++) {
-        DEBUG_PRINT("Got a ready fds.");      
+        if(evlist[i].data.ptr == NULL) { /* New connection to accept */
+            conn = accept_connection();    
+            
+        } else {
+            /* read or write available on a connection. 
+             * The connection is in the data.ptr of the event.
+             * */
+            handle_io_event(conn);
+
+        }
     }
     
 }
