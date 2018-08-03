@@ -65,6 +65,9 @@ struct connection {
     size_t input_len;    /* bytes read into request buffer */
     size_t input_bufsize; /* actual size of buffer */
 
+    char *outheader;
+    size_t outheader_len;
+    size_t outheader_sent;
 
 };
 
@@ -196,6 +199,9 @@ static struct connection* connection_new() {
     conn->input_buffer = NULL;
     conn->input_len = 0; 
     conn->input_bufsize = 0;
+    conn->outheader = NULL;
+    conn->outheader_len = 0;
+    conn->outheader_sent = 0;
     conn->client_ip = NULL;
     conn->client_port = 0;
     return conn;
@@ -204,6 +210,7 @@ static struct connection* connection_new() {
 
 static void connection_free(struct connection *conn) {
     free(conn->input_buffer);
+    free(conn->outheader);
     free(conn->ev);
     free(conn->client_ip);
     free(conn);   
@@ -326,15 +333,49 @@ static void destroy_connection(struct connection *conn) {
     connection_free(conn);
 }
 
+static void parse_input(struct connection *conn) {
+}
 /* All data has been read, now it's time to process it 
  * and construct the response, then go to STATE_SEND_HEADER state
  * to inform the event to to start sending data.
  * */
 static void process_request(struct connection *conn) {
-    // for now, destroy connection.
+    parse_input(conn);
+
+    char *test_reply = "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: text/html\r\n"
+                        "\r\n"
+                        "<h1>OMG It works!</h1>";
+    size_t test_reply_len = strlen(test_reply);
+    conn->outheader = xmalloc(test_reply_len+1);
+    memcpy(conn->outheader, test_reply, test_reply_len);
+    conn->outheader[test_reply_len] = '\0';
+
+}
+
+static void epoll_write_reply(struct connection *conn) {
+//TODO: DO THIS
     conn->state = STATE_DONE;
 }
 
+static void epoll_write_header(struct connection *conn) {
+    size_t nsent;
+
+    nsent = write(conn->sock, conn->outheader, 
+            conn->outheader_len - conn->outheader_sent);
+    if(nsent < 0) {
+        if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return;
+        } else if(errno == ECONNRESET) {
+            conn->state = STATE_DONE;
+        }
+    } 
+    
+    conn->outheader_sent += nsent;
+    if(conn->outheader_sent == conn->outheader_len) {
+        conn->state = STATE_SEND_REPLY;
+    }
+}
 /*
  * epoll() told us there is input available  
  * When we get EOF (connection closed by peer or error )
@@ -365,6 +406,7 @@ static void epoll_read(struct connection *conn) {
             // TODO: Research erros on tlpi book.
             return; // no problem, we'll come back for next event.
         } else if(errno == ECONNRESET) {
+            // TODO: SHOULD SEND ERROR
             goto all_request_in_buffer;
         } 
         else {
@@ -401,18 +443,12 @@ static void epoll_read(struct connection *conn) {
     } else { /* read EOF */ goto all_request_in_buffer; }
 
 all_request_in_buffer:
-    DEBUG_PRINT_RAW("Request from %s:%d:\n", conn->client_ip, 
-            conn->client_port);
-    char c = conn->input_buffer[conn->input_len-1];
-    conn->input_buffer[conn->input_len-1] = '\0';
-    DEBUG_PRINT_RAW("[%s", conn->input_buffer);
-    DEBUG_PRINT_RAW("%c]\n", c);
-    conn->input_buffer[conn->input_len-1] = c;
-    conn->state = STATE_DONE;
+    free(conn->input_buffer);
+    conn->input_buffer = NULL;
+    process_request(conn);
+    // TODO: set interest in write event.
+    conn->state = STATE_SEND_HEADER;
 
-    destroy_connection(conn); 
-    /* small optimization: we don't have to go through
-    anothe iteration of the epoll loop */
 }
 
 static void handle_socket_io_event(struct connection *conn) {
@@ -421,10 +457,10 @@ static void handle_socket_io_event(struct connection *conn) {
             epoll_read(conn);
             break;
         case STATE_SEND_HEADER:
-           
+            epoll_write_header(conn);
            break;
         case STATE_SEND_REPLY:
-           
+           epoll_write_reply(conn);
            break;
         case STATE_DONE:
         case STATE_INVALID:
