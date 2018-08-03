@@ -11,6 +11,10 @@
  *
  * */
 
+#define RECV_BUFSIZE 1024 /* how much data to read() from socket at once */
+#define HTTP_MAXREQUESTSIZE 8*1024 /* 8K just like Apache. */
+
+
 #ifndef NO_IPV6 /* TODO: Add IPv6 support */
 #   define HAVE_INET6
 #endif
@@ -23,7 +27,6 @@
  #define DEBUG_PRINT(fmt, args...) /* Don't do anything in release builds */
  #define DEBUG_PRINT_RAW(fmt, args...)
 #endif
-
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -46,6 +49,8 @@
 struct connection {
     int sock;
     struct epol_event *ev;
+    int client_port;
+    char *client_ip;
 
     enum {
         STATE_INVALID,
@@ -55,8 +60,11 @@ struct connection {
         STATE_DONE
     } state;
 
-    char *input_buffer; /* Buffer when we store input data before processing headers */
-    size_t input_len;    /* data read into request buffer */
+    char *input_buffer; /* Buffer where we store input data before 
+                           processing headers. Grows dynamically. */
+    size_t input_len;    /* bytes read into request buffer */
+    size_t input_bufsize; /* actual size of buffer */
+
 
 };
 
@@ -64,6 +72,7 @@ struct connection {
 static int sockserv;    /* Server socket we accept connections from. */
 static int epoll_set;   /* fd of the epoll set used for i/o multiplexing. */
 static volatile int running = 1; /* Volatile so there's no problem in signal handler*/
+static char *logfile_str = NULL; /* default NULL: stdout*/
 static FILE *logfile = NULL; /* Log to console by default*/;
 static size_t open_connections = 0;
 //static size_T nbytes_served;
@@ -72,7 +81,7 @@ static size_t open_connections = 0;
 /* Config variables. They can be overriden by command line options */
 static int port = 8080;                 /* port to listen to */
 static const char *bindaddr_str = NULL; /* Bind interface. Default: NULL: 0.0.0.0 */
-static int sockserv_backlog = -1; /* somaxconn */
+static int sockserv_backlog = -1; /* somaxconn TODO:*/
 
 /* --- END GLOBALS --- */
 
@@ -86,12 +95,18 @@ static void xerr(int errcode, char *errmsg, int errno) {
 }
 
 /*
- * Error checked wrapper around malloc()
+ * Error checked wrappers around malloc() and realloc()
  * */
 static void *xmalloc(size_t size) {
     void *p = malloc(size);
     if(p == NULL)
         err(1, "malloc() failed. Big trouble.");
+    return p;
+}
+static void *xrealloc(void *ptr, size_t size) {
+    void *p = realloc(ptr, size);
+    if(p == NULL)
+        err(1, "realloc() failed. Big trouble.");
     return p;
 }
 
@@ -114,16 +129,17 @@ static void print_help(char *program_name) {
  * If an optional option is missing, this sets the default 
  * (if needed) */
 static void parse_cmdline(int argc, const char **argv) {
-    static char *shortopts = "p:a:hv";
+    static char *shortopts = "p:a:l:hv";
     static struct option longopts[] = 
     {
         {"port", required_argument, NULL, 'p'},
         {"bind-address", required_argument, NULL, 'a'},
         {"help", no_argument, NULL, 'h'}, // info: optional_argument
-        {"version", no_argument, NULL, 'v'}
+        {"version", no_argument, NULL, 'v'},
+        {"logfile", required_argument, NULL, 'l'}
     };
     
-    opterr = 1;
+    opterr = 0;
     int index; char c;
     while((c = getopt_long(argc, argv, shortopts, 
                     longopts, &index)) != -1) {
@@ -138,6 +154,9 @@ static void parse_cmdline(int argc, const char **argv) {
             case 'a': /* --bind-address, -a */
                 bindaddr_str = optarg;
 
+                break;
+            case 'l': /* --logfile, -l */
+                logfile_str = optarg;
                 break;
             case 'h': /* --help, -h */
                 print_help(argv[0]);
@@ -175,14 +194,18 @@ static struct connection* connection_new() {
     conn->ev = NULL;
     conn->state = STATE_RECV;
     conn->input_buffer = NULL;
-    conn->input_len = 0;
-    return conn;    
+    conn->input_len = 0; 
+    conn->input_bufsize = 0;
+    conn->client_ip = NULL;
+    conn->client_port = 0;
+    return conn;
 
 }
 
 static void connection_free(struct connection *conn) {
     free(conn->input_buffer);
     free(conn->ev);
+    free(conn->client_ip);
     free(conn);   
 }
 
@@ -221,7 +244,8 @@ static void init_sockserv(void) {
         err(1, "invalid --bindaddr");
     serv_addr.sin_port = htons(port);
     
-    if(bind(sockserv, (struct sockaddr*)&serv_addr, sizeof(serv_addr) ) == -1)
+    if(bind(sockserv, (struct sockaddr*)&serv_addr, 
+                sizeof(serv_addr) ) == -1)
         err(1, "bind()");
 
     if(listen(sockserv, sockserv_backlog) == -1)
@@ -250,15 +274,15 @@ static void epoll_init(void) {
 static struct connection *accept_connection() {
     int socket; /* client socket */
     struct sockaddr_in client_addr;
-    size_t client_addr_len;
+    socklen_t client_addr_len;
     struct connection *conn;
     struct epoll_event *ev;
 
     socket = accept(sockserv, (struct sockaddr *) &client_addr, &client_addr_len);
     if(socket == -1) {
-        if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-            return;
-            DEBUG_PRINT_RAW(".");
+        if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) { 
+            /* too many concurrent connections */
+            return NULL;
         } else {
             perror("accept()");
             err(1, "accept()");
@@ -277,14 +301,29 @@ static struct connection *accept_connection() {
     if(epoll_ctl(epoll_set, EPOLL_CTL_ADD, socket, ev) == -1)
         err(1,"epoll_ctl(client socket)");
     
-    open_connections++;   
+    conn->client_ip = (char *) xmalloc(INET_ADDRSTRLEN);
+    conn->client_ip = inet_ntop(AF_INET, (void*)&(client_addr.sin_addr),
+            conn->client_ip, INET_ADDRSTRLEN);
+    conn->client_port = client_addr.sin_port;
+
+    open_connections++;
+    DEBUG_PRINT("Accepted connection from %s:%d\n", conn->client_ip,
+            conn->client_port);
     return conn;
 }
 
 static void destroy_connection(struct connection *conn) {
-    close(conn->sock); /* by closing the socket...*/
-    connection_free(conn);
+    if(epoll_ctl(epoll_set, EPOLL_CTL_DEL, conn->sock, NULL) == -1)
+        err(1, "epoll_ctl(EPOLL_CTL_DEL) in destroy_connection()");
+    
+    if(close(conn->sock) == -1) {
+        DEBUG_PRINT("errno after close: %d\t", errno);
+        perror("close()"); 
+    }
     open_connections--;
+    DEBUG_PRINT("Connection closed %s:%d\n", conn->client_ip, 
+            conn->client_port);
+    connection_free(conn);
 }
 
 /* All data has been read, now it's time to process it 
@@ -304,33 +343,79 @@ static void process_request(struct connection *conn) {
  * */
 static void epoll_read(struct connection *conn) {
     
-    // test version
     ssize_t nread;
-    
-    // In first call allocate memory for input buffer.
-    if(conn->input_buffer == NULL) conn->input_buffer = xmalloc(1024);
-    nread = read(conn->sock, conn->input_buffer, 1024);
-    if(nread == -1) {
-        if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-            // TODO: Research the EINTR error.
-            return; // no proble, we'll come back for next event.
-        }
-    } else if(nread == 0) {
-        // EOF reached: for socket : peer has closed connection.
-        // TODO: read on linux programming interface book about read() on a
-        // socket
-        DEBUG_PRINT_RAW("%s", conn->input_buffer);
-        process_request(conn);
-    } else {
-        /* Read some data */
-        conn->input_len += nread;
+    size_t available;
+
+    /* Make sure there are RECV_BUFSIZE available space 
+     * in conn->input_buffer before a read;
+     * */
+    available = conn->input_bufsize - conn->input_len;
+    if(available < RECV_BUFSIZE) {
+        conn->input_buffer = xrealloc(conn->input_buffer, 
+                conn->input_bufsize + RECV_BUFSIZE);
+        conn->input_bufsize += RECV_BUFSIZE;
     }
-    // TODO: after we process request? say to epoll
-    // we are interested in write available events and 
-    // change state so that we can write answer.
+    /* END DYNAMICALLY GROWING THE BUFFER */
+
+    /* Read data*/
+    nread = read(conn->sock, conn->input_buffer + conn->input_len
+            , RECV_BUFSIZE);
+    if(nread < 0) {
+        if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            // TODO: Research erros on tlpi book.
+            return; // no problem, we'll come back for next event.
+        } else if(errno == ECONNRESET) {
+            goto all_request_in_buffer;
+        } 
+        else {
+            perror("read()");
+            err(1, "read() in epoll_read()");
+        }
+    } else if(nread > 0) {
+        conn->input_len += nread;
+        if(conn->input_len > HTTP_MAXREQUESTSIZE) {
+            DEBUG_PRINT("Maximum HTTP request size exceeded.\n");
+            //TODO: answer with an error code. refactor this
+            //so as not to mix http with low leve i/o
+        }
+        
+        size_t l = conn->input_len;
+        if(conn->input_len >= 4 && 
+                (       conn->input_buffer[l-4] == '\r'
+                    &&  conn->input_buffer[l-3] == '\n'
+                    &&  conn->input_buffer[l-2] == '\r'
+                    &&  conn->input_buffer[l-1] == '\n'
+                ) || 
+                
+                (
+                        conn->input_buffer[l-2] == '\n'
+                    &&  conn->input_buffer[l-1] == '\n'
+                )
+                ) {
+                                
+                    /* End HEADERS */
+                    goto all_request_in_buffer;
+                }
+
+        return;
+    } else { /* read EOF */ goto all_request_in_buffer; }
+
+all_request_in_buffer:
+    DEBUG_PRINT_RAW("Request from %s:%d:\n", conn->client_ip, 
+            conn->client_port);
+    char c = conn->input_buffer[conn->input_len-1];
+    conn->input_buffer[conn->input_len-1] = '\0';
+    DEBUG_PRINT_RAW("[%s", conn->input_buffer);
+    DEBUG_PRINT_RAW("%c]\n", c);
+    conn->input_buffer[conn->input_len-1] = c;
+    conn->state = STATE_DONE;
+
+    destroy_connection(conn); 
+    /* small optimization: we don't have to go through
+    anothe iteration of the epoll loop */
 }
 
-static void handle_io_event(struct connection *conn) {
+static void handle_socket_io_event(struct connection *conn) {
    switch(conn->state) {
         case STATE_RECV:
             epoll_read(conn);
@@ -366,21 +451,26 @@ static void httpd_epoll(void){
 
     for(size_t i=0; i<nfds_ready; i++) {
         if(evlist[i].data.ptr == NULL) { /* New connection to accept */
-            conn = accept_connection();    
+            conn = accept_connection();
+            if(conn == NULL) {
+                /* Too many concurrent connections */
+                return;
+            }    
             
         } else {
             /* read or write available on a connection. 
              * The connection is in the data.ptr of the event.
              * */
-            handle_io_event(conn);
+            conn = (struct connection *) evlist[i].data.ptr;
+            handle_socket_io_event(conn);
 
         }
     }
     
 }
+
 /* --- SIGNAL HANDLING --- */
 static void handle_signals(int sig) {
-    fprintf(stderr, "Signal received. QUITING...\n");
     running = 0;
 }
 
@@ -395,7 +485,15 @@ int main(int argc, char **argv) {
     parse_cmdline(argc, argv); /* This will fill all global config vars */    
     
     // TODO: Log file
-    logfile = stdout;
+    if(logfile == NULL) logfile = stdout;
+    else {
+        logfile = fopen(logfile_str, "a");
+        if(logfile == NULL) {
+            perror("Cannot open log file\n");
+            fprintf(stderr, "Falling back to stdout for logs.\n");
+            logfile = stdout;
+        }
+    }
 
     /* Signal handling */
     if(signal(SIGPIPE, handle_sigpipe) == SIG_ERR)
@@ -406,15 +504,19 @@ int main(int argc, char **argv) {
         err(1,"signal(SIGTERM)");
 
     init_sockserv(); /* Create and bind server socket */
-    printf(logfile, "Listening on %s:%d", bindaddr_str ? "0.0.0.0" : bindaddr_str, port);
-  
     epoll_init();   /* initialize epoll set */
-
+    
+    fprintf(logfile, "Listening on %s:%d\n", 
+            bindaddr_str ? bindaddr_str : "0.0.0.0",
+            port );
+    
     while(running) httpd_epoll(); /* Event loop */
     
     /* Cleanup */
     // TODO
-
+    printf("\nQuitting...\n");
+    close(sockserv);
+    fclose(logfile);
 
     return 0;
 }
