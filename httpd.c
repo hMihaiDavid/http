@@ -11,6 +11,7 @@
 
 #define RECV_BUFSIZE 128 /* how much data to read() from socket at once */
 #define SEND_BUFSIZE 1024
+#define SENDFILE_COUNT 2048
 #define HTTP_MAXREQUESTSIZE 8*1024 /* 8K just like Apache. */
 
 
@@ -40,6 +41,8 @@
 #include <arpa/inet.h>
 #include <getopt.h>
 #include <sys/epoll.h>
+#include <sys/sendfile.h>
+#include <sys/stat.h>
 #include <signal.h>
 
 /* Object representing a connection being processed.
@@ -65,6 +68,19 @@ struct connection {
         REPLY_FROMFILE
     } reply_type;
 
+    enum {
+        METHOD_INVALID,
+        METHOD_UNSUPPORTED,
+        METHOD_GET,
+        METHOD_HEAD,
+    
+    } method;
+
+    char *url;
+    char *host;
+    char *user_agent;
+    char *referer;
+
     char *input_buffer; /* Buffer where we store input data before 
                            processing headers. Grows dynamically. */
     size_t input_len;    /* bytes read into request buffer */
@@ -77,6 +93,12 @@ struct connection {
     char *reply;
     size_t reply_len;
     size_t reply_sent;
+    
+    /* if set, reply and outheader will not be free()'ed because they are not
+     * on the heap, they are default responses hardcoded in the data segment.  */
+    int default_reply;
+
+    int reply_fd;
 };
 
 /* --- GLOBALS --- */
@@ -121,7 +143,7 @@ static void *xrealloc(void *ptr, size_t size) {
     return p;
 }
 
-static size_t min(size_t a, size_t b) {
+static ssize_t min(ssize_t a, ssize_t b) {
     return a < b ? a : b;
 }
 
@@ -209,6 +231,12 @@ static struct connection* connection_new() {
     conn->ev = NULL;
     conn->state = STATE_RECV;
     conn->reply_type = REPLY_FROMMEM;
+    conn->default_reply = 0;
+
+    conn->url = NULL;
+    conn->host = NULL;
+    conn->user_agent = NULL;
+    conn->referer = NULL;
     
     conn->input_buffer = NULL;
     conn->input_len = 0; 
@@ -221,6 +249,8 @@ static struct connection* connection_new() {
     conn->reply = NULL;
     conn->reply_len = 0;
     conn->reply_sent = 0;
+    
+    conn->reply_fd = -1;
 
     conn->client_ip = NULL;
     conn->client_port = 0;
@@ -230,9 +260,21 @@ static struct connection* connection_new() {
 
 static void connection_free(struct connection *conn) {
     free(conn->input_buffer);
-    free(conn->outheader);
+    if(!conn->default_reply) {
+        free(conn->outheader);
+        free(conn->reply);
+    }
     free(conn->ev);
     free(conn->client_ip);
+    /* // No need to free these ones cause they point inside input_buffer 
+     * // for efficiency.
+     
+    free(conn->url);
+    free(conn->host);
+    free(conn->user_agent);
+    free(conn->referer);
+    
+    */
     free(conn);   
 }
 
@@ -347,40 +389,84 @@ static void destroy_connection(struct connection *conn) {
         DEBUG_PRINT("errno after close: %d\t", errno);
         perror("close()"); 
     }
+    if(conn->reply_fd > -1) close(conn->reply_fd);
     open_connections--;
     DEBUG_PRINT("Connection closed %s:%d\n", conn->client_ip, 
             conn->client_port);
     connection_free(conn);
 }
 
-static void memrespond(struct connection *conn, int http_code, char *response) {
-
-    conn->outheader_len = asprintf(&conn->outheader, 
-            "HTTP/1.1 %d OK\r\n"
-            "Content-Type: text/html\r\n"
-            "\r\n"
-            ,
-            http_code
-            );
-    if(conn->outheader_len == -1)
-        err(1, "asprintf(outheader) memrespond()");
-
+static void default_reply(struct connection *conn, int code) {
+    conn->default_reply = 1;
+    conn->reply_type = REPLY_FROMMEM;
+    conn->state = STATE_SEND_HEADER;
     
+    switch(code){
+        case 400:
+            #define REPLY_400 "<!DOCTYPE html><html><head><title>400 Bad Request</title></head><body><h1>400 Bad Request</h1><p>Malformed request detected.</p></body></html>"
+            #define HEADER_400 "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\n\r\n"
+            conn->outheader = HEADER_400;
+            conn->outheader_len = sizeof(HEADER_400)-1;
+            conn->reply = REPLY_400;
+            conn->reply_len = sizeof(REPLY_400)-1;
+            break;
+        case 403:
+            break;
+        case 404:
+            break;
+        case 500:
+        default:
+
+            break;
+    }
+
+
 }
 
-static void parse_input(struct connection *conn) {
+static void parse_http_method(struct connection *conn, char *str) {
+    if(strcmp("GET", str) == 0) {
+        conn->method = METHOD_GET; return;
+    } else if(strcmp("HEAD", str) == 0) {
+        conn->method = METHOD_HEAD; return;
+    } else {
+        conn->method = METHOD_INVALID; return;
+    }
 }
+
+/* TODO: MAKE SURE IT'S MEMORY SAFE */
+static void parse_input(struct connection *conn) {
+    char *p, c;
+
+    /* parse method */
+    p = conn->input_buffer;
+    while(*p != '\0' && !isblank(*p)) p++;
+    c = *p;
+    *p = '\0'; /* terminate http method string */
+    parse_http_method(conn, conn->input_buffer);
+    if(conn->method == METHOD_INVALID || c == '\0') {
+        default_reply(conn, 400); return;
+    }
+    p++;
+
+    /* parse url */
+    while(*p != '\0' && isblank(*p)) p++;
+    conn->url = p;
+    while(*p != '\0' && !isblank(*p)) p++;
+    if(*p == '\0') { default_reply(conn, 400); return; }
+    *p = '\0'; /* terminate url */
+    
+    // TODO: parse header lines (Host, Referer, User-Agent, ...)
+
+    DEBUG_PRINT("%s %s\n", conn->input_buffer, conn->url);
+}
+
 /* All data has been read, now it's time to process it 
  * and construct the response, then go to STATE_SEND_HEADER state
  * to inform the event to to start sending data.
  * */
 static void process_request(struct connection *conn) {
     parse_input(conn);
-    free(conn->input_buffer);
-    conn->input_buffer = NULL; /*VERY IMPORTANT TO AVOID DOUBLE-FREE VULNERABILITY.*/
-    
-    
-
+    if(conn->default_reply) return;
 
     char *test_header = "HTTP/1.1 200 OK\r\n"
                         "Content-Type: text/html\r\n"
@@ -392,7 +478,7 @@ static void process_request(struct connection *conn) {
     conn->outheader_len = test_header_len;
     conn->outheader[test_header_len] = '\0';
     
-    char *test_reply = "<h1>TEST REPLY FROM MEM!!!!</h1>";
+    /*char *test_reply = "<h1>TEST REPLY FROM MEM!!!!</h1>";
 
     size_t test_reply_len = strlen(test_reply);
     conn->reply = xmalloc(test_reply_len+1);
@@ -401,16 +487,20 @@ static void process_request(struct connection *conn) {
     conn->reply[test_reply_len] = '\0';
 
     conn->reply_type = REPLY_FROMMEM;
+    */
 
+    struct stat thefile;
+    conn->reply_fd = open("test.html", O_RDONLY);
+    fstat(conn->reply_fd, &thefile);
+    conn->reply_len = thefile.st_size;
+    conn->reply_type = REPLY_FROMFILE;
 }
 
 static void epoll_write_reply_fromem(struct connection *conn) {
-//TODO: DO THIS
+    ssize_t nsent;
     
-    size_t nsent;
-    
-    nsent = write(conn->sock, conn->reply + conn->reply_sent, 
-            min(SEND_BUFSIZE, conn->reply_len));
+        nsent = write(conn->sock, conn->reply + conn->reply_sent, 
+                min(SEND_BUFSIZE, conn->reply_len - conn->reply_sent));
 
     if(nsent < 0) {
         if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
@@ -429,10 +519,22 @@ static void epoll_write_reply_fromem(struct connection *conn) {
 
 static void epoll_write_reply_fromfile(struct connection *conn) {
 // TODO
+    ssize_t nsent;
+    nsent = sendfile(conn->sock, conn->reply_fd, NULL, 
+            min(SENDFILE_COUNT, conn->reply_len - conn->reply_sent));
+    if(nsent < 0) {
+        if(errno == EAGAIN) { return; }
+        else err(1, "sendfile()");
+    }
+
+    conn->reply_sent += nsent;
+    if(conn->reply_sent == conn->reply_len) {
+        conn->state = STATE_DONE;
+    }
 }
 
 static void epoll_write_header(struct connection *conn) {
-    size_t nsent;
+    ssize_t nsent;
     //fprintf(stderr, ".");
     nsent = write(conn->sock, conn->outheader + conn->outheader_sent, 
             conn->outheader_len - conn->outheader_sent);
