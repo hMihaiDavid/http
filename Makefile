@@ -1,2 +1,2 @@
 all:
-	gcc httpd.c -g -o httpd -DDEBUG
+	gcc httpd.c -o httpd -g -DDEBUG

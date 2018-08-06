@@ -2,16 +2,15 @@
 
 /* Possible build options: -DDEBUG -DNO_IPV6 */
 
-#define MAX_EVENTS 128 /* Maximum number of events to be returned from
+#define MAX_EVENTS 1024 /* Maximum number of events to be returned from
                          a single epoll_wait() call */
-/* when you have multiple threads read from the same epoll-fd concurrently. In
- * that case the size of your event array determines how many events get
- * handled by a single thread (i.e. a smaller number might give you greater
- * parallelism).
- *
+/* when you have multiple threads read from the same epoll-fd concurrently the size of 
+ * your event array determines how many events get handled by a single thread 
+ * (i.e. a smaller number might give you greater parallelism).
  * */
 
-#define RECV_BUFSIZE 1024 /* how much data to read() from socket at once */
+#define RECV_BUFSIZE 128 /* how much data to read() from socket at once */
+#define SEND_BUFSIZE 1024
 #define HTTP_MAXREQUESTSIZE 8*1024 /* 8K just like Apache. */
 
 
@@ -59,6 +58,12 @@ struct connection {
         STATE_SEND_REPLY,
         STATE_DONE
     } state;
+    
+    enum {
+        REPLY_INVALID,
+        REPLY_FROMMEM,
+        REPLY_FROMFILE
+    } reply_type;
 
     char *input_buffer; /* Buffer where we store input data before 
                            processing headers. Grows dynamically. */
@@ -69,6 +74,9 @@ struct connection {
     size_t outheader_len;
     size_t outheader_sent;
 
+    char *reply;
+    size_t reply_len;
+    size_t reply_sent;
 };
 
 /* --- GLOBALS --- */
@@ -111,6 +119,10 @@ static void *xrealloc(void *ptr, size_t size) {
     if(p == NULL)
         err(1, "realloc() failed. Big trouble.");
     return p;
+}
+
+static size_t min(size_t a, size_t b) {
+    return a < b ? a : b;
 }
 
 static void print_help(char *program_name) {
@@ -196,12 +208,20 @@ static struct connection* connection_new() {
     conn->sock = -1;
     conn->ev = NULL;
     conn->state = STATE_RECV;
+    conn->reply_type = REPLY_FROMMEM;
+    
     conn->input_buffer = NULL;
     conn->input_len = 0; 
     conn->input_bufsize = 0;
+    
     conn->outheader = NULL;
     conn->outheader_len = 0;
     conn->outheader_sent = 0;
+    
+    conn->reply = NULL;
+    conn->reply_len = 0;
+    conn->reply_sent = 0;
+
     conn->client_ip = NULL;
     conn->client_port = 0;
     return conn;
@@ -333,6 +353,21 @@ static void destroy_connection(struct connection *conn) {
     connection_free(conn);
 }
 
+static void memrespond(struct connection *conn, int http_code, char *response) {
+
+    conn->outheader_len = asprintf(&conn->outheader, 
+            "HTTP/1.1 %d OK\r\n"
+            "Content-Type: text/html\r\n"
+            "\r\n"
+            ,
+            http_code
+            );
+    if(conn->outheader_len == -1)
+        err(1, "asprintf(outheader) memrespond()");
+
+    
+}
+
 static void parse_input(struct connection *conn) {
 }
 /* All data has been read, now it's time to process it 
@@ -341,34 +376,73 @@ static void parse_input(struct connection *conn) {
  * */
 static void process_request(struct connection *conn) {
     parse_input(conn);
+    free(conn->input_buffer);
+    conn->input_buffer = NULL; /*VERY IMPORTANT TO AVOID DOUBLE-FREE VULNERABILITY.*/
+    
+    
 
-    char *test_reply = "HTTP/1.1 200 OK\r\n"
+
+    char *test_header = "HTTP/1.1 200 OK\r\n"
                         "Content-Type: text/html\r\n"
-                        "\r\n"
-                        "<h1>OMG It works!</h1>";
+                        "\r\n";
+
+    size_t test_header_len = strlen(test_header);
+    conn->outheader = xmalloc(test_header_len+1);
+    memcpy(conn->outheader, test_header, test_header_len);
+    conn->outheader_len = test_header_len;
+    conn->outheader[test_header_len] = '\0';
+    
+    char *test_reply = "<h1>TEST REPLY FROM MEM!!!!</h1>";
+
     size_t test_reply_len = strlen(test_reply);
-    conn->outheader = xmalloc(test_reply_len+1);
-    memcpy(conn->outheader, test_reply, test_reply_len);
-    conn->outheader[test_reply_len] = '\0';
+    conn->reply = xmalloc(test_reply_len+1);
+    memcpy(conn->reply, test_reply, test_reply_len);
+    conn->reply_len = test_reply_len;
+    conn->reply[test_reply_len] = '\0';
+
+    conn->reply_type = REPLY_FROMMEM;
 
 }
 
-static void epoll_write_reply(struct connection *conn) {
+static void epoll_write_reply_fromem(struct connection *conn) {
 //TODO: DO THIS
-    conn->state = STATE_DONE;
+    
+    size_t nsent;
+    
+    nsent = write(conn->sock, conn->reply + conn->reply_sent, 
+            min(SEND_BUFSIZE, conn->reply_len));
+
+    if(nsent < 0) {
+        if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return;
+        } else if(errno == ECONNRESET) {
+            conn->state = STATE_DONE;
+            return;
+        } else err(1, "write() epoll_write_reply_fromem");
+    }
+    
+    conn->reply_sent += nsent;
+    if(conn->reply_sent == conn->reply_len) {
+        conn->state = STATE_DONE;
+    }
+}
+
+static void epoll_write_reply_fromfile(struct connection *conn) {
+// TODO
 }
 
 static void epoll_write_header(struct connection *conn) {
     size_t nsent;
-
-    nsent = write(conn->sock, conn->outheader, 
+    //fprintf(stderr, ".");
+    nsent = write(conn->sock, conn->outheader + conn->outheader_sent, 
             conn->outheader_len - conn->outheader_sent);
     if(nsent < 0) {
         if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
             return;
         } else if(errno == ECONNRESET) {
             conn->state = STATE_DONE;
-        }
+            return;
+        } else err(1, "write() epoll_write_header");
     } 
     
     conn->outheader_sent += nsent;
@@ -376,6 +450,7 @@ static void epoll_write_header(struct connection *conn) {
         conn->state = STATE_SEND_REPLY;
     }
 }
+
 /*
  * epoll() told us there is input available  
  * When we get EOF (connection closed by peer or error )
@@ -418,7 +493,7 @@ static void epoll_read(struct connection *conn) {
         if(conn->input_len > HTTP_MAXREQUESTSIZE) {
             DEBUG_PRINT("Maximum HTTP request size exceeded.\n");
             //TODO: answer with an error code. refactor this
-            //so as not to mix http with low leve i/o
+            //so as not to mix http with low level i/o
         }
         
         size_t l = conn->input_len;
@@ -443,10 +518,14 @@ static void epoll_read(struct connection *conn) {
     } else { /* read EOF */ goto all_request_in_buffer; }
 
 all_request_in_buffer:
-    free(conn->input_buffer);
-    conn->input_buffer = NULL;
     process_request(conn);
-    // TODO: set interest in write event.
+    
+    /* From now on we are only interested in write events from this connection */ 
+    struct epoll_event *ev = conn->ev;
+    ev->events = EPOLLOUT; 
+    if(epoll_ctl(epoll_set, EPOLL_CTL_MOD,conn->sock, conn->ev) == -1)
+        err(1, "epoll_ctl(EPOLL_CTL_MOD) set_epoll_event_to_write");
+    
     conn->state = STATE_SEND_HEADER;
 
 }
@@ -460,7 +539,12 @@ static void handle_socket_io_event(struct connection *conn) {
             epoll_write_header(conn);
            break;
         case STATE_SEND_REPLY:
-           epoll_write_reply(conn);
+           
+           if(conn->reply_type == REPLY_FROMFILE)
+               epoll_write_reply_fromfile(conn);
+           else if(conn->reply_type == REPLY_FROMMEM)
+               epoll_write_reply_fromem(conn);
+
            break;
         case STATE_DONE:
         case STATE_INVALID:
