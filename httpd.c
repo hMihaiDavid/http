@@ -2,14 +2,14 @@
 
 /* Possible build options: -DDEBUG -DNO_IPV6 */
 
-#define MAX_EVENTS 1024 /* Maximum number of events to be returned from
+#define MAX_EVENTS 128 /* Maximum number of events to be returned from
                          a single epoll_wait() call */
 /* when you have multiple threads read from the same epoll-fd concurrently the size of 
  * your event array determines how many events get handled by a single thread 
  * (i.e. a smaller number might give you greater parallelism).
  * */
 
-#define RECV_BUFSIZE 128 /* how much data to read() from socket at once */
+#define RECV_BUFSIZE 512 /* how much data to read() from socket at once */
 #define SEND_BUFSIZE 1024
 #define SENDFILE_COUNT 2048
 #define HTTP_MAXREQUESTSIZE 8*1024 /* 8K just like Apache. */
@@ -118,6 +118,7 @@ struct connection {
 };
 
 /* --- GLOBALS --- */
+const char *www_path = NULL; /* path to the www directory to serve. */
 static int sockserv;    /* Server socket we accept connections from. */
 static int epoll_set;   /* fd of the epoll set used for i/o multiplexing. */
 static volatile int running = 1; /* Volatile so there's no problem in signal handler*/
@@ -231,6 +232,14 @@ static void parse_cmdline(int argc, const char **argv) {
                 err(1, "Error parsing command line options.");
         }
     }
+    /* The remaining argument is the path to the www directory */
+    if(optind >= argc) {
+		/* missing www directory */
+		fprintf(stderr, "Missing path to www directory. See %s --help\n", argv[0]);
+		exit(1);
+	}
+	
+	www_path = argv[optind];
 
 }
 
@@ -798,6 +807,11 @@ int main(int argc, char **argv) {
         err(1, "signal(SIGINT)");
     if(signal(SIGTERM, handle_signals) == SIG_ERR)
         err(1,"signal(SIGTERM)");
+        
+    /* change current directory to www directory */
+    if(chdir(www_path) == -1)
+		err(1, "Cannot open www directory.");
+	fprintf(stderr, "Serving directory: %s\n", www_path);
 
     init_sockserv(); /* Create and bind server socket */
     epoll_init();   /* initialize epoll set */
