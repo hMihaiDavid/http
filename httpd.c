@@ -14,6 +14,19 @@
 #define SENDFILE_COUNT 2048
 #define HTTP_MAXREQUESTSIZE 8*1024 /* 8K just like Apache. */
 
+/* DEFAULT REPLIES TO ERROR CODES */
+#define REPLY_400 "<!DOCTYPE html><html><head><title>400 Bad Request</title></head><body><h1>400 Bad Request</h1><p>Malformed request detected.</p></body></html>"
+#define HEADER_400 "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\n\r\n"
+
+#define REPLY_403 "<!DOCTYPE html><html><head><title>403 Forbidden</title></head><body><h1>403 Forbidden</h1><p>You are forbidden to access the requested resource on this server.</p></body></html>"
+#define HEADER_403 "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n\r\n"
+
+#define REPLY_404 "<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1><p>Sorry. The requested resource was not found on this server.</p></body></html>"
+#define HEADER_404 "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n\r\n"
+
+#define REPLY_500 "<!DOCTYPE html><html><head><title>500 Internal Server Error</title></head><body><h1>500 Internal Server Error</h1><p>An error has occurred while processing your request.</p></body></html>"
+#define HEADER_500 "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html\r\n\r\n"
+
 
 #ifndef NO_IPV6 /* TODO: Add IPv6 support */
 #   define HAVE_INET6
@@ -97,7 +110,6 @@ struct connection {
     /* if set, reply and outheader will not be free()'ed because they are not
      * on the heap, they are default responses hardcoded in the data segment.  */
     int default_reply;
-
     int reply_fd;
 };
 
@@ -403,24 +415,38 @@ static void default_reply(struct connection *conn, int code) {
     
     switch(code){
         case 400:
-            #define REPLY_400 "<!DOCTYPE html><html><head><title>400 Bad Request</title></head><body><h1>400 Bad Request</h1><p>Malformed request detected.</p></body></html>"
-            #define HEADER_400 "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\n\r\n"
             conn->outheader = HEADER_400;
             conn->outheader_len = sizeof(HEADER_400)-1;
             conn->reply = REPLY_400;
             conn->reply_len = sizeof(REPLY_400)-1;
             break;
         case 403:
+            conn->outheader = HEADER_403;
+            conn->outheader_len = sizeof(HEADER_403)-1;
+            conn->reply = REPLY_403;
+            conn->reply_len = sizeof(REPLY_403)-1;
             break;
         case 404:
+            conn->outheader = HEADER_404;
+            conn->outheader_len = sizeof(HEADER_404)-1;
+            conn->reply = REPLY_404;
+            conn->reply_len = sizeof(REPLY_404)-1;
             break;
         case 500:
         default:
-
-            break;
+			conn->outheader = HEADER_500;
+            conn->outheader_len = sizeof(HEADER_500)-1;
+            conn->reply = REPLY_500;
+            conn->reply_len = sizeof(REPLY_500)-1;
     }
+}
 
-
+static int sanity_check_url(struct connection *conn) {
+	char *url = conn->url;
+	for(int i=0; url[i] != '\0' && url[i+1] != '\0'; i++) {
+		if(url[i] == '.' && url[i+1] == '.') return 0;
+	}
+	return 1;
 }
 
 static void parse_http_method(struct connection *conn, char *str) {
@@ -443,21 +469,61 @@ static void parse_input(struct connection *conn) {
     c = *p;
     *p = '\0'; /* terminate http method string */
     parse_http_method(conn, conn->input_buffer);
-    if(conn->method == METHOD_INVALID || c == '\0') {
-        default_reply(conn, 400); return;
-    }
+    if(conn->method == METHOD_INVALID || c == '\0') goto bad_request;
     p++;
 
     /* parse url */
-    while(*p != '\0' && isblank(*p)) p++;
+    while(*p != '\0' && (isblank(*p) || *p == '/')) p++;
     conn->url = p;
     while(*p != '\0' && !isblank(*p)) p++;
-    if(*p == '\0') { default_reply(conn, 400); return; }
+    if(*p == '\0') goto bad_request;
     *p = '\0'; /* terminate url */
-    
+    p++;
+    if(!sanity_check_url(conn)) goto bad_request;
+        
+    return;
     // TODO: parse header lines (Host, Referer, User-Agent, ...)
+    
+bad_request:
+	default_reply(conn, 400);
+	DEBUG_PRINT("bad_request: %s %s (errno: %d: ", conn->input_buffer, conn->url, errno);
+	perror("\n");
+	return;
+}
 
-    DEBUG_PRINT("%s %s\n", conn->input_buffer, conn->url);
+static void process_request_get(struct connection *conn) {
+	struct stat statbuf;
+	char *content_type;
+		
+	if(stat(conn->url, &statbuf) == -1) {
+		if(errno == EACCES) { default_reply(conn, 403); return; }
+		else if(errno == ENOENT) { default_reply(conn, 404); return; }
+		else { default_reply(conn, 500); return; }
+	}
+	// TODO: SET Content-Type correctly ex. Content-Type: text/html; charset=ISO-8859-1 TODO: CHUNKED ENCODING???
+	content_type = "text/html";
+	
+	/* Setting the response header */
+	conn->outheader_len = asprintf(&conn->outheader,
+		"HTTP/1.1 200 OK\r\n"
+		"Content-Type: %s\r\n"
+		"Content-Length: %lld\r\n"
+		"\r\n"
+		,
+		content_type, (long long)statbuf.st_size);
+	if(conn->outheader_len == -1) { default_reply(conn, 500); return; }
+	
+	if(conn->method == METHOD_HEAD) return; /* Nothing more to do */
+	
+	/* serve the file */
+	conn->reply_type = REPLY_FROMFILE;
+	conn->reply_len = (size_t) statbuf.st_size;
+	conn->reply_fd = open(conn->url, O_RDONLY);
+	if(conn->reply_fd == -1) {
+		if(errno == EACCES) { default_reply(conn, 403); return; }
+		else if(errno == ENOENT) { default_reply(conn, 404); return; }
+		else { default_reply(conn, 500); return; }
+	}	
 }
 
 /* All data has been read, now it's time to process it 
@@ -467,33 +533,20 @@ static void parse_input(struct connection *conn) {
 static void process_request(struct connection *conn) {
     parse_input(conn);
     if(conn->default_reply) return;
-
-    char *test_header = "HTTP/1.1 200 OK\r\n"
-                        "Content-Type: text/html\r\n"
-                        "\r\n";
-
-    size_t test_header_len = strlen(test_header);
-    conn->outheader = xmalloc(test_header_len+1);
-    memcpy(conn->outheader, test_header, test_header_len);
-    conn->outheader_len = test_header_len;
-    conn->outheader[test_header_len] = '\0';
     
-    /*char *test_reply = "<h1>TEST REPLY FROM MEM!!!!</h1>";
-
-    size_t test_reply_len = strlen(test_reply);
-    conn->reply = xmalloc(test_reply_len+1);
-    memcpy(conn->reply, test_reply, test_reply_len);
-    conn->reply_len = test_reply_len;
-    conn->reply[test_reply_len] = '\0';
-
-    conn->reply_type = REPLY_FROMMEM;
-    */
-
-    struct stat thefile;
-    conn->reply_fd = open("test.html", O_RDONLY);
-    fstat(conn->reply_fd, &thefile);
-    conn->reply_len = thefile.st_size;
-    conn->reply_type = REPLY_FROMFILE;
+    switch(conn->method) {
+		case METHOD_GET:
+			process_request_get(conn);
+			break;
+		case METHOD_HEAD:
+			process_request_get(conn);
+			break;
+		case METHOD_INVALID:
+		case METHOD_UNSUPPORTED:
+		default:
+			default_reply(conn, 400);
+			return;
+	}
 }
 
 static void epoll_write_reply_fromem(struct connection *conn) {
@@ -507,6 +560,7 @@ static void epoll_write_reply_fromem(struct connection *conn) {
             return;
         } else if(errno == ECONNRESET) {
             conn->state = STATE_DONE;
+            destroy_connection(conn);
             return;
         } else err(1, "write() epoll_write_reply_fromem");
     }
@@ -514,11 +568,11 @@ static void epoll_write_reply_fromem(struct connection *conn) {
     conn->reply_sent += nsent;
     if(conn->reply_sent == conn->reply_len) {
         conn->state = STATE_DONE;
+        destroy_connection(conn);
     }
 }
 
 static void epoll_write_reply_fromfile(struct connection *conn) {
-// TODO
     ssize_t nsent;
     nsent = sendfile(conn->sock, conn->reply_fd, NULL, 
             min(SENDFILE_COUNT, conn->reply_len - conn->reply_sent));
@@ -530,6 +584,7 @@ static void epoll_write_reply_fromfile(struct connection *conn) {
     conn->reply_sent += nsent;
     if(conn->reply_sent == conn->reply_len) {
         conn->state = STATE_DONE;
+        destroy_connection(conn);
     }
 }
 
@@ -543,13 +598,19 @@ static void epoll_write_header(struct connection *conn) {
             return;
         } else if(errno == ECONNRESET) {
             conn->state = STATE_DONE;
+            destroy_connection(conn);
             return;
         } else err(1, "write() epoll_write_header");
     } 
     
     conn->outheader_sent += nsent;
     if(conn->outheader_sent == conn->outheader_len) {
-        conn->state = STATE_SEND_REPLY;
+        if(conn->method == METHOD_HEAD){
+			conn->state = STATE_DONE;
+			destroy_connection(conn); 
+		}
+		else
+			conn->state = STATE_SEND_REPLY;
     }
 }
 
@@ -583,8 +644,7 @@ static void epoll_read(struct connection *conn) {
             // TODO: Research erros on tlpi book.
             return; // no problem, we'll come back for next event.
         } else if(errno == ECONNRESET) {
-            // TODO: SHOULD SEND ERROR
-            goto all_request_in_buffer;
+            goto terminate_connection;
         } 
         else {
             perror("read()");
@@ -594,8 +654,7 @@ static void epoll_read(struct connection *conn) {
         conn->input_len += nread;
         if(conn->input_len > HTTP_MAXREQUESTSIZE) {
             DEBUG_PRINT("Maximum HTTP request size exceeded.\n");
-            //TODO: answer with an error code. refactor this
-            //so as not to mix http with low level i/o
+			goto terminate_connection;
         }
         
         size_t l = conn->input_len;
@@ -617,7 +676,7 @@ static void epoll_read(struct connection *conn) {
                 }
 
         return;
-    } else { /* read EOF */ goto all_request_in_buffer; }
+    } else { /* read EOF */ goto terminate_connection; }
 
 all_request_in_buffer:
     process_request(conn);
@@ -629,7 +688,11 @@ all_request_in_buffer:
         err(1, "epoll_ctl(EPOLL_CTL_MOD) set_epoll_event_to_write");
     
     conn->state = STATE_SEND_HEADER;
-
+    return;
+    
+terminate_connection:
+	conn->state = STATE_DONE;
+	destroy_connection(conn);
 }
 
 static void handle_socket_io_event(struct connection *conn) {
@@ -650,6 +713,7 @@ static void handle_socket_io_event(struct connection *conn) {
            break;
         case STATE_DONE:
         case STATE_INVALID:
+			DEBUG_PRINT("%s\n", conn->state == STATE_DONE ? "DONE" : "INVALID");
             destroy_connection(conn);
            break;
 
