@@ -95,21 +95,25 @@ struct connection {
     char *referer;
 
     char *input_buffer; /* Buffer where we store input data before 
-                           processing headers. Grows dynamically. */
+                           processing headers. Grows dynamically in multiples of RECV_BUFSIZE */
     size_t input_len;    /* bytes read into request buffer */
-    size_t input_bufsize; /* actual size of buffer */
+    size_t input_bufsize; /* actual size of buffer. */
 
+	/* Buffer to store the HTTP response header. */
     char *outheader;
     size_t outheader_len;
     size_t outheader_sent;
 
+	/* Stores the reply if reply_type is REPLY_FROMMEM, otherwise unused */
     char *reply;
     size_t reply_len;
     size_t reply_sent;
     
-    /* if set, reply and outheader will not be free()'ed because they are not
+    /* Boolean. If set, reply and outheader will not be free()'ed because they are not
      * on the heap, they are default responses hardcoded in the data segment.  */
     int default_reply;
+    
+    /* If reply_type is REPLY_FROMFILE, this is the filedesc from which to serve the request. */
     int reply_fd;
 };
 
@@ -312,6 +316,8 @@ static void init_sockserv(void) {
     sockserv = socket(AF_INET, SOCK_STREAM, 0);
     if(sockserv == -1)
         err(1, "socket()");
+    if(set_nonblocking(sockserv) == -1)
+        err(1, "set_nonblocking()");
 
     /* reuse address */
     optval = 1;
@@ -329,11 +335,10 @@ static void init_sockserv(void) {
                 sizeof(serv_addr) ) == -1)
         err(1, "bind()");
 
-    if(listen(sockserv, sockserv_backlog) == -1)
-        err(1, "listen()");
-    
-    if(set_nonblocking(sockserv) == -1)
-        err(1, "set_nonblocking()");
+    if(listen(sockserv, sockserv_backlog) == -1) {
+		perror("listen:");
+		err(1, "listen()");
+	}
 }
 
 static void epoll_init(void) {
@@ -359,13 +364,13 @@ static struct connection *accept_connection() {
     struct connection *conn;
     struct epoll_event *ev;
 
-    socket = accept(sockserv, (struct sockaddr *) &client_addr, &client_addr_len);
+    socket = accept(sockserv, NULL, NULL);
     if(socket == -1) {
         if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) { 
-            /* too many concurrent connections */
+            /* probably too many concurrent connections */
             return NULL;
         } else {
-            perror("accept()");
+            perror("accept():");
             err(1, "accept()");
         }
     }
@@ -382,11 +387,12 @@ static struct connection *accept_connection() {
     if(epoll_ctl(epoll_set, EPOLL_CTL_ADD, socket, ev) == -1)
         err(1,"epoll_ctl(client socket)");
     
+    /* 
     conn->client_ip = (char *) xmalloc(INET_ADDRSTRLEN);
     conn->client_ip = inet_ntop(AF_INET, (void*)&(client_addr.sin_addr),
             conn->client_ip, INET_ADDRSTRLEN);
     conn->client_port = client_addr.sin_port;
-
+	*/
     open_connections++;
     DEBUG_PRINT("Accepted connection from %s:%d\n", conn->client_ip,
             conn->client_port);
@@ -500,6 +506,10 @@ static void process_request_get(struct connection *conn) {
 		else if(errno == ENOENT) { default_reply(conn, 404); return; }
 		else { default_reply(conn, 500); return; }
 	}
+	
+	/* Only accept regular files. TODO: Support also directory listings. */
+	if(!S_ISREG(statbuf.st_mode)) { default_reply(conn, 404); return; }
+	
 	// TODO: SET Content-Type correctly ex. Content-Type: text/html; charset=ISO-8859-1 TODO: CHUNKED ENCODING???
 	content_type = "text/html";
 	
