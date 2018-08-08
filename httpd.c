@@ -57,6 +57,8 @@
 #include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <signal.h>
+#include <sys/prctl.h>
+#include <sys/sysinfo.h> 
 
 /* Object representing a connection being processed.
  * Functions: connection_new(), connection_free()
@@ -125,6 +127,7 @@ static volatile int running = 1; /* Volatile so there's no problem in signal han
 static char *logfile_str = NULL; /* default NULL: stdout*/
 static FILE *logfile = NULL; /* Log to console by default*/;
 static size_t open_connections = 0;
+int is_parent = 1; /* boolean */
 //static size_T nbytes_served;
 
 
@@ -132,6 +135,7 @@ static size_t open_connections = 0;
 static int port = 8080;                 /* port to listen to */
 static const char *bindaddr_str = NULL; /* Bind interface. Default: NULL: 0.0.0.0 */
 static int sockserv_backlog = -1; /* somaxconn TODO:*/
+static int workers = 0;
 
 /* --- END GLOBALS --- */
 
@@ -813,17 +817,35 @@ int main(int argc, char **argv) {
 	fprintf(stderr, "Serving directory: %s\n", www_path);
 
     init_sockserv(); /* Create and bind server socket */
-    epoll_init();   /* initialize epoll set */
+    
     
     fprintf(logfile, "Listening on %s:%d\n", 
             bindaddr_str ? bindaddr_str : "0.0.0.0",
             port );
+            
+    if(workers <= 0) workers = get_nprocs();
+    if(workers > 1) {
+		for(int i=0; i < workers-1; i++) { /* the parent is a worker too. */
+			pid_t pid;
+			pid = fork();
+			if(pid == -1) err(1, "fork()");
+			else if(pid == 0) {
+				is_parent = 0;
+				/* If parent terminates, all children get SIGTERM */
+				if(prctl(PR_SET_PDEATHSIG, SIGTERM))
+					err(1, "prctl(): One less worker process!");
+				break;
+			}
+		}
+	}
+	
+    epoll_init();   /* initialize epoll set and add sockserv to it.*/
     
     while(running) httpd_epoll(); /* Event loop */
     
     /* Cleanup */
     // TODO
-    printf("\nQuitting...\n");
+    if(is_parent ) printf("\nQuitting...\n");
     close(sockserv);
     fclose(logfile);
 
