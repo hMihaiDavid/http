@@ -63,7 +63,7 @@
  * */
 struct connection {
     int sock;
-    struct epol_event *ev;
+    struct epoll_event *ev;
     int client_port;
     char *client_ip;
 
@@ -498,8 +498,6 @@ static void parse_input(struct connection *conn) {
     
 bad_request:
 	default_reply(conn, 400);
-	DEBUG_PRINT("bad_request: %s %s (errno: %d: ", conn->input_buffer, conn->url, errno);
-	perror("\n");
 	return;
 }
 
@@ -664,7 +662,7 @@ static void epoll_read(struct connection *conn) {
     if(nread < 0) {
         if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
 			return;
-        else if(errno == ECONNRESET || errno == EPIPE)
+        else if(errno == ECONNRESET)
             goto terminate_connection; 
         else err(1, "read() in epoll_read()");
     } else if(nread > 0) {
@@ -778,11 +776,11 @@ static void handle_signals(int sig) {
     running = 0;
 }
 
+#ifdef DEBUG
 static void handle_sigpipe(int sig) {
-    // TODO: If multithreaded, use a lock here! or deprecate this
-    // and run a infinite loop.
     fprintf(stderr, "[DEBUG] Received SIGPIPE\n");
 }
+#endif
 /* --- END SIGNAL HANDLING --- */
 
 int main(int argc, char **argv) {
@@ -800,8 +798,13 @@ int main(int argc, char **argv) {
     }
 
     /* Signal handling */
+#ifdef DEBUG
     if(signal(SIGPIPE, handle_sigpipe) == SIG_ERR)
+#else
+	if(signal(SIGPIPE, SIG_IGN) == SIG_ERR)
+#endif
         err(1,"signal(SIGPIPE)");
+    
     if(signal(SIGINT, handle_signals) == SIG_ERR)
         err(1, "signal(SIGINT)");
     if(signal(SIGTERM, handle_signals) == SIG_ERR)
