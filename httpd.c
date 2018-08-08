@@ -571,40 +571,45 @@ static void process_request(struct connection *conn) {
 static void epoll_write_reply_fromem(struct connection *conn) {
     ssize_t nsent;
     
-        nsent = write(conn->sock, conn->reply + conn->reply_sent, 
-                min(SEND_BUFSIZE, conn->reply_len - conn->reply_sent));
+    nsent = write(conn->sock, conn->reply + conn->reply_sent, 
+            //min(SEND_BUFSIZE, 
+            conn->reply_len - conn->reply_sent);//)
+	
+	if(nsent < 0) {
+        if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) { return; }
+        else if(errno == EPIPE || errno == ECONNRESET) goto terminate_connection;
+        else  {perror("sendfile()");err(1, "sendfile()");}
+    }
 
-    if(nsent < 0) {
-        if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-            return;
-        } else if(errno == ECONNRESET) {
-            conn->state = STATE_DONE;
-            destroy_connection(conn);
-            return;
-        } else err(1, "write() epoll_write_reply_fromem");
-    }
-    
     conn->reply_sent += nsent;
-    if(conn->reply_sent == conn->reply_len) {
-        conn->state = STATE_DONE;
-        destroy_connection(conn);
-    }
+    if(conn->reply_sent == conn->reply_len) goto terminate_connection;
+    
+    return;
+    
+terminate_connection:
+	conn->state = STATE_DONE;
+    destroy_connection(conn);
 }
 
 static void epoll_write_reply_fromfile(struct connection *conn) {
     ssize_t nsent;
     nsent = sendfile(conn->sock, conn->reply_fd, NULL, 
-            min(SENDFILE_COUNT, conn->reply_len - conn->reply_sent));
+            //min(SENDFILE_COUNT, 
+            conn->reply_len - conn->reply_sent); //)
     if(nsent < 0) {
-        if(errno == EAGAIN) { return; }
-        else err(1, "sendfile()");
+        if(errno == EAGAIN || errno == EINTR) { return; }
+        else if(errno == EPIPE || errno == ECONNRESET) goto terminate_connection;
+        else  {perror("sendfile()");err(1, "sendfile()");}
     }
 
     conn->reply_sent += nsent;
-    if(conn->reply_sent == conn->reply_len) {
-        conn->state = STATE_DONE;
-        destroy_connection(conn);
-    }
+    if(conn->reply_sent == conn->reply_len) goto terminate_connection;
+    
+    return;
+    
+terminate_connection:
+	conn->state = STATE_DONE;
+    destroy_connection(conn);
 }
 
 static void epoll_write_header(struct connection *conn) {
@@ -613,24 +618,26 @@ static void epoll_write_header(struct connection *conn) {
     nsent = write(conn->sock, conn->outheader + conn->outheader_sent, 
             conn->outheader_len - conn->outheader_sent);
     if(nsent < 0) {
-        if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+        if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
             return;
-        } else if(errno == ECONNRESET) {
-            conn->state = STATE_DONE;
-            destroy_connection(conn);
-            return;
-        } else err(1, "write() epoll_write_header");
+        else if(errno == ECONNRESET || errno == EPIPE)
+			goto terminate_connection;
+        else err(1, "write() epoll_write_header");
     } 
     
     conn->outheader_sent += nsent;
     if(conn->outheader_sent == conn->outheader_len) {
-        if(conn->method == METHOD_HEAD){
-			conn->state = STATE_DONE;
-			destroy_connection(conn); 
-		}
+        if(conn->method == METHOD_HEAD)
+			goto terminate_connection;
 		else
 			conn->state = STATE_SEND_REPLY;
     }
+    
+    return;
+    
+terminate_connection:
+	conn->state = STATE_DONE;
+	destroy_connection(conn);
 }
 
 /*
@@ -659,16 +666,11 @@ static void epoll_read(struct connection *conn) {
     nread = read(conn->sock, conn->input_buffer + conn->input_len
             , RECV_BUFSIZE);
     if(nread < 0) {
-        if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-            // TODO: Research erros on tlpi book.
-            return; // no problem, we'll come back for next event.
-        } else if(errno == ECONNRESET) {
-            goto terminate_connection;
-        } 
-        else {
-            perror("read()");
-            err(1, "read() in epoll_read()");
-        }
+        if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+			return;
+        else if(errno == ECONNRESET || errno == EPIPE)
+            goto terminate_connection; 
+        else err(1, "read() in epoll_read()");
     } else if(nread > 0) {
         conn->input_len += nread;
         if(conn->input_len > HTTP_MAXREQUESTSIZE) {
@@ -694,8 +696,9 @@ static void epoll_read(struct connection *conn) {
                     goto all_request_in_buffer;
                 }
 
-        return;
     } else { /* read EOF */ goto terminate_connection; }
+	
+	return;
 
 all_request_in_buffer:
     process_request(conn);
