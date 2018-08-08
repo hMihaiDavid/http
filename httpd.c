@@ -16,16 +16,16 @@
 
 /* DEFAULT REPLIES TO ERROR CODES */
 #define REPLY_400 "<!DOCTYPE html><html><head><title>400 Bad Request</title></head><body><h1>400 Bad Request</h1><p>Malformed request detected.</p></body></html>"
-#define HEADER_400 "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\n\r\n"
+#define HEADER_400 "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n"
 
 #define REPLY_403 "<!DOCTYPE html><html><head><title>403 Forbidden</title></head><body><h1>403 Forbidden</h1><p>You are forbidden to access the requested resource on this server.</p></body></html>"
-#define HEADER_403 "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n\r\n"
+#define HEADER_403 "HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n"
 
 #define REPLY_404 "<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1><p>Sorry. The requested resource was not found on this server.</p></body></html>"
-#define HEADER_404 "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n\r\n"
+#define HEADER_404 "HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n"
 
 #define REPLY_500 "<!DOCTYPE html><html><head><title>500 Internal Server Error</title></head><body><h1>500 Internal Server Error</h1><p>An error has occurred while processing your request.</p></body></html>"
-#define HEADER_500 "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html\r\n\r\n"
+#define HEADER_500 "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n"
 
 
 #ifndef NO_IPV6 /* TODO: Add IPv6 support */
@@ -524,6 +524,7 @@ static void process_request_get(struct connection *conn) {
 	/* Setting the response header */
 	conn->outheader_len = asprintf(&conn->outheader,
 		"HTTP/1.1 200 OK\r\n"
+		"Connection: close\r\n"
 		"Content-Type: %s\r\n"
 		"Content-Length: %lld\r\n"
 		"\r\n"
