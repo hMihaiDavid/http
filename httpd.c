@@ -43,6 +43,7 @@
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -137,6 +138,43 @@ static const char *bindaddr_str = NULL; /* Bind interface. Default: NULL: 0.0.0.
 static int sockserv_backlog = -1; /* somaxconn TODO:*/
 static int workers = 0;
 
+/* MIME table that associates file extensions to mime type strings
+ * suitable for the Content-Type header. Must be NULL-terminated.
+ * Taken from https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types/Complete_list_of_MIME_types
+ * */
+static const char *mime_table[] = {
+	"html htm", 	"text/html",
+	"js", 			"application/javascript",
+	"css", 			"text/css",
+	"pdf",			"application/pdf",
+	"json", 		"application/json",
+	"jpeg jpg",		"image/jpeg",
+	"xhtml",		"application/xhtml+xml",
+	"ico",			"image/x-icon",
+	"gif",			"image/gif",
+	"png",			"image/png",
+	"bmp",			"image/bmp",
+	"svg",			"image/svg+xml",
+	"mpeg",			"video/mpeg",
+	"webm",			"video/webm",
+	"swf",			"application/x-shockwave-flash",
+	"weba",			"audio/webm",
+	"xml",			"application/xml",
+	"avi",			"video/x-msvideo",
+	"tif tiff",		"image/tiff",
+	"wav",			"audio/x-wav",
+	"webp",			"image/webp",
+	"zip",			"application/zip",
+	"tar",			"application/x-tar",
+	"7z",			"application/x-7z-compressed",
+	"rar",			"application/x-rar-compressed",
+	"ogv",			"video/ogg",
+	"oga",			"audio/ogg",
+	"ogx",			"application/ogg",
+	
+	NULL, NULL
+};
+
 /* --- END GLOBALS --- */
 
 static void err(int errcode, char *errmsg) {
@@ -177,6 +215,7 @@ static void print_help(char *program_name) {
             "--help, -h" SOME_TABS "Display this help message and exit.\n"
             "--version, -v" SOME_TABS "Print version number and exit. \n"
             "--port, -p <port>" SOME_TABS "Specify listening port.\n" //TODO: COMPLETE ALL THIS
+            "--workers, -w <number>" SOME_TABS "Specify the number of worker processes. By default as many as cpu cores.\n"
             ,
             program_name
             );
@@ -187,14 +226,15 @@ static void print_help(char *program_name) {
  * If an optional option is missing, this sets the default 
  * (if needed) */
 static void parse_cmdline(int argc, const char **argv) {
-    static char *shortopts = "p:a:l:hv";
+    static char *shortopts = "p:a:l:hvw:";
     static struct option longopts[] = 
     {
         {"port", required_argument, NULL, 'p'},
         {"bind-address", required_argument, NULL, 'a'},
         {"help", no_argument, NULL, 'h'}, // info: optional_argument
         {"version", no_argument, NULL, 'v'},
-        {"logfile", required_argument, NULL, 'l'}
+        {"logfile", required_argument, NULL, 'l'},
+        {"workers", required_argument, NULL, 'w'}
     };
     
     opterr = 0;
@@ -209,9 +249,11 @@ static void parse_cmdline(int argc, const char **argv) {
                 if(port == 0) err(1,"Invalid port.");
                 
                 break;
+            case 'w': /* --workers, -w */
+				workers = atoi(optarg); /* 0 means deefault */
+				break;
             case 'a': /* --bind-address, -a */
                 bindaddr_str = optarg;
-
                 break;
             case 'l': /* --logfile, -l */
                 logfile_str = optarg;
@@ -219,7 +261,6 @@ static void parse_cmdline(int argc, const char **argv) {
             case 'h': /* --help, -h */
                 print_help(argv[0]);
                 exit(0);
-
                 break;
             case 'v': /* --version, -v*/
                   printf("httpd version 0.0.0. See %s --help for usage and more information.\n",
@@ -305,6 +346,21 @@ static void connection_free(struct connection *conn) {
     
     */
     free(conn);   
+}
+
+/* Given a file extension, returns the adequate mime type string
+ * by looking it up in the mime_table. If not found,
+ * "application/octet-stream" is returned.
+ * */
+static const char *mime_lookup(const char *extension) {
+	while(*extension != '\0' && *extension == '.') extension++;
+	
+	char **t = mime_table;
+	while(*t != NULL) {
+		if(strstr(*t, extension) != NULL) return t[1];
+		t+=2;
+	}
+	return "application/octet-stream";
 }
 
 /* Sets the O_NONBLOCK flag on a file descriptor. 
@@ -459,8 +515,15 @@ static void default_reply(struct connection *conn, int code) {
 
 static int sanity_check_url(struct connection *conn) {
 	char *url = conn->url;
-	for(int i=0; url[i] != '\0' && url[i+1] != '\0'; i++) {
-		if(url[i] == '.' && url[i+1] == '.') return 0;
+	size_t n = 0;
+	for(int i=0; 	url[i] != '\0' && url[i+1] != '\0' 
+				&&  url[i+2] != '\0'; i++) {
+		/* HTTP standard says 8000 SHOULD be max len of a full url */
+		if(n > 8128) return 0;
+		/* detect path traversal attempt */
+		if(url[i] == '.' && url[i+1] == '.' && url[i+2] == '/') 
+			return 0;
+		n++;
 	}
 	return 1;
 }
@@ -507,7 +570,7 @@ bad_request:
 
 static void process_request_get(struct connection *conn) {
 	struct stat statbuf;
-	char *content_type;
+	const char *content_type;
 		
 	if(stat(conn->url, &statbuf) == -1) {
 		if(errno == EACCES) { default_reply(conn, 403); return; }
@@ -518,8 +581,17 @@ static void process_request_get(struct connection *conn) {
 	/* Only accept regular files. TODO: Support also directory listings. */
 	if(!S_ISREG(statbuf.st_mode)) { default_reply(conn, 404); return; }
 	
-	// TODO: SET Content-Type correctly ex. Content-Type: text/html; charset=ISO-8859-1 TODO: CHUNKED ENCODING???
-	content_type = "text/html";
+	// TODO: charset=ISO-8859-1 TODO: CHUNKED ENCODING???
+	
+	ssize_t len = (ssize_t)strlen(conn->url);
+	const char *extension = conn->url+len;
+	while(len >= 0) {
+		if(*extension == '.') break;
+		extension--;
+		len--;
+	}
+	if(len < 0) content_type = "application/octet-stream";
+	else content_type = mime_lookup(extension++);
 	
 	/* Setting the response header */
 	conn->outheader_len = asprintf(&conn->outheader,
@@ -542,7 +614,7 @@ static void process_request_get(struct connection *conn) {
 		if(errno == EACCES) { default_reply(conn, 403); return; }
 		else if(errno == ENOENT) { default_reply(conn, 404); return; }
 		else { default_reply(conn, 500); return; }
-	}	
+	}
 }
 
 /* All data has been read, now it's time to process it 
@@ -578,7 +650,7 @@ static void epoll_write_reply_fromem(struct connection *conn) {
 	if(nsent < 0) {
         if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) { return; }
         else if(errno == EPIPE || errno == ECONNRESET) goto terminate_connection;
-        else  {perror("sendfile()");err(1, "sendfile()");}
+        else  { perror("sendfile()"); err(1, "sendfile()");}
     }
 
     conn->reply_sent += nsent;
@@ -596,7 +668,7 @@ static void epoll_write_reply_fromfile(struct connection *conn) {
     nsent = sendfile(conn->sock, conn->reply_fd, NULL, 
             min(SENDFILE_COUNT, conn->reply_len - conn->reply_sent));
     if(nsent < 0) {
-        if(errno == EAGAIN || errno == EINTR) { DEBUG_PRINT("======> %llu\n", (unsigned long long)nsent); return; }
+        if(errno == EAGAIN || errno == EINTR) { return; }
         else if(errno == EPIPE || errno == ECONNRESET) goto terminate_connection;
         else  {perror("sendfile()");err(1, "sendfile()");}
     }

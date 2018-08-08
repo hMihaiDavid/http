@@ -1,5 +1,7 @@
-improve accept_connection
+Keep-Alive
+Time-Out
+HTTP Ranges
+If-Modified-Since
+directory listing
+fix logfile
 man tcp TCP_CORK
-optimize default response
-fix socket code
-null request
