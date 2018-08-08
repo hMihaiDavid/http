@@ -1,5 +1,6 @@
 Keep-Alive
 Time-Out
+max conn/ip
 HTTP Ranges
 If-Modified-Since
 directory listing

@@ -60,6 +60,7 @@
 #include <signal.h>
 #include <sys/prctl.h>
 #include <sys/sysinfo.h> 
+#include <time.h>
 
 /* Object representing a connection being processed.
  * Functions: connection_new(), connection_free()
@@ -69,6 +70,8 @@ struct connection {
     struct epoll_event *ev;
     int client_port;
     char *client_ip;
+
+	time_t last_active;
 
     enum {
         STATE_INVALID,
@@ -130,12 +133,15 @@ static FILE *logfile = NULL; /* Log to console by default*/;
 static size_t open_connections = 0;
 int is_parent = 1; /* boolean */
 //static size_T nbytes_served;
+/* Current seconds since epoch, updated each iteration of epoll loop. Use for timing out idle connections */
+time_t now = -1;
 
 
 /* Config variables. They can be overriden by command line options */
 static int port = 8080;                 /* port to listen to */
 static const char *bindaddr_str = NULL; /* Bind interface. Default: NULL: 0.0.0.0 */
 static int sockserv_backlog = -1; /* somaxconn TODO:*/
+time_t maxidle = 60; /* if a connection is idle for this many seconds or more, it's terminated.*/
 static int workers = 0;
 
 /* MIME table that associates file extensions to mime type strings
@@ -302,7 +308,8 @@ static struct connection* connection_new() {
     conn->state = STATE_RECV;
     conn->reply_type = REPLY_FROMMEM;
     conn->default_reply = 0;
-
+	conn->last_active = now;
+	
     conn->url = NULL;
     conn->host = NULL;
     conn->user_agent = NULL;
@@ -789,8 +796,14 @@ terminate_connection:
 }
 
 static void handle_socket_io_event(struct connection *conn) {
-   switch(conn->state) {
-        case STATE_RECV:
+	
+	if(now - conn->last_active > maxidle) {
+		DEBUG_PRINT("Connection maxidle exceeded.\n");
+		conn->state = STATE_INVALID;
+	} else conn->last_active = now;
+	
+	switch(conn->state) {
+		case STATE_RECV:
             epoll_read(conn);
             break;
         case STATE_SEND_HEADER:
@@ -828,6 +841,7 @@ static void httpd_epoll(void){
         else err(1, "epoll_wait()");
     }
 
+	now = time(NULL);
     for(size_t i=0; i<nfds_ready; i++) {
         if(evlist[i].data.ptr == NULL) { /* New connection to accept */
             conn = accept_connection();
