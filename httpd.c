@@ -754,10 +754,7 @@ static void httpd_epoll(void){
     for(size_t i=0; i<nfds_ready; i++) {
         if(evlist[i].data.ptr == NULL) { /* New connection to accept */
             conn = accept_connection();
-            if(conn == NULL) {
-                /* Too many concurrent connections */
-                return;
-            }    
+            if(conn == NULL) continue;
             
         } else {
             /* read or write available on a connection. 
