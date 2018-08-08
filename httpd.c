@@ -412,10 +412,7 @@ static void destroy_connection(struct connection *conn) {
     if(epoll_ctl(epoll_set, EPOLL_CTL_DEL, conn->sock, NULL) == -1)
         err(1, "epoll_ctl(EPOLL_CTL_DEL) in destroy_connection()");
     
-    if(close(conn->sock) == -1) {
-        DEBUG_PRINT("errno after close: %d\t", errno);
-        perror("close()"); 
-    }
+    if(conn->sock > -1) close(conn->sock);
     if(conn->reply_fd > -1) close(conn->reply_fd);
     open_connections--;
     DEBUG_PRINT("Connection closed %s:%d\n", conn->client_ip, 
@@ -594,10 +591,9 @@ terminate_connection:
 static void epoll_write_reply_fromfile(struct connection *conn) {
     ssize_t nsent;
     nsent = sendfile(conn->sock, conn->reply_fd, NULL, 
-            //min(SENDFILE_COUNT, 
-            conn->reply_len - conn->reply_sent); //)
+            min(SENDFILE_COUNT, conn->reply_len - conn->reply_sent));
     if(nsent < 0) {
-        if(errno == EAGAIN || errno == EINTR) { return; }
+        if(errno == EAGAIN || errno == EINTR) { DEBUG_PRINT("======> %llu\n", (unsigned long long)nsent); return; }
         else if(errno == EPIPE || errno == ECONNRESET) goto terminate_connection;
         else  {perror("sendfile()");err(1, "sendfile()");}
     }
