@@ -4,17 +4,13 @@
 
 #define MAX_EVENTS 128 /* Maximum number of events to be returned from
                          a single epoll_wait() call */
-/* when you have multiple threads read from the same epoll-fd concurrently the size of 
- * your event array determines how many events get handled by a single thread 
- * (i.e. a smaller number might give you greater parallelism).
- * */
 
 #define RECV_BUFSIZE 512 /* how much data to read() from socket at once */
-#define SEND_BUFSIZE 1024
-#define SENDFILE_COUNT 2048
+#define SEND_BUFSIZE 1024 /* how much data to write() at once from memory (if reply is on memory) */
+#define SENDFILE_COUNT 2048 /* how much data to send at once from file if reply is a file (normally )*/
 #define HTTP_MAXREQUESTSIZE 8*1024 /* 8K just like Apache. */
 
-/* DEFAULT REPLIES TO ERROR CODES */
+/* DEFAULT REPLIES FOR ERROR CODES. FEEL FREE TO MODIFY REPLY_XXX */
 #define REPLY_400 "<!DOCTYPE html><html><head><title>400 Bad Request</title></head><body><h1>400 Bad Request</h1><p>Malformed request detected.</p></body></html>"
 #define HEADER_400 "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n"
 
@@ -143,6 +139,8 @@ static const char *bindaddr_str = NULL; /* Bind interface. Default: NULL: 0.0.0.
 static int sockserv_backlog = -1; /* somaxconn TODO:*/
 time_t maxidle = 60; /* if a connection is idle for this many seconds or more, it's terminated.*/
 static int workers = 0;
+const char *default_page = "index.html";
+int listing_disabled = 0; /* boolean */
 
 /* MIME table that associates file extensions to mime type strings
  * suitable for the Content-Type header. Must be NULL-terminated.
@@ -520,7 +518,7 @@ static void default_reply(struct connection *conn, int code) {
     }
 }
 
-static int sanity_check_url(struct connection *conn) {
+static int parse_url(struct connection *conn) {
 	char *url = conn->url;
 	size_t n = 0;
 	for(int i=0; 	url[i] != '\0' && url[i+1] != '\0' 
@@ -559,13 +557,18 @@ static void parse_input(struct connection *conn) {
     p++;
 
     /* parse url */
-    while(*p != '\0' && (isblank(*p) || *p == '/')) p++;
+    while(*p != '\0' && isblank(*p) ) p++;
     conn->url = p;
+    
     while(*p != '\0' && !isblank(*p)) p++;
     if(*p == '\0') goto bad_request;
     *p = '\0'; /* terminate url */
+    if(conn->url[0] == '/' && conn->url[1] == '\0')
+		conn->url[0] = '.';
+	else while(*(conn->url) == '/') conn->url++;
     p++;
-    if(!sanity_check_url(conn)) goto bad_request;
+    
+    if(!parse_url(conn)) goto bad_request;
         
     return;
     // TODO: parse header lines (Host, Referer, User-Agent, ...)
@@ -575,7 +578,81 @@ bad_request:
 	return;
 }
 
+static void serve_file(struct connection *conn, const char *path, ssize_t size) {
+	struct stat statbuf;
+	
+	if(size < 0) { /* Obtain size from fs if it is not given. */
+		if(stat(path, &statbuf) == -1) {
+			if(errno == EACCES) { default_reply(conn, 403); return; }
+			else if(errno == ENOENT) { default_reply(conn, 404); return; }
+			else { default_reply(conn, 500); return; }
+		}
+		size = (ssize_t) statbuf.st_size;
+	}
+	
+	/* serve the file */
+	conn->reply_type = REPLY_FROMFILE;
+	conn->reply_len = (size_t) size;
+	conn->reply_fd = open(path, O_RDONLY);
+	if(conn->reply_fd == -1) {
+		if(errno == EACCES) { default_reply(conn, 403); return; }
+		else if(errno == ENOENT) { default_reply(conn, 404); return; }
+		else { default_reply(conn, 500); return; }
+	}
+	return;
+}
+
+static void serve_directory_listing(struct connection *conn) {
+	default_reply(conn, 500); /* Not implemented yet, TODO */
+}
+
 static void process_request_get(struct connection *conn) {
+	struct stat statbuf;
+	const char *content_type;
+	
+	if(stat(conn->url, &statbuf) == -1) {
+		if(errno == EACCES) { default_reply(conn, 403); return; }
+		else if(errno == ENOENT) { default_reply(conn, 404); return; }
+		else { default_reply(conn, 500); return; }
+	}
+	
+	if(S_ISREG(statbuf.st_mode)) {
+		serve_file(conn, conn->url, (ssize_t)statbuf.st_size); 
+		return;
+	} else if(S_ISDIR(statbuf.st_mode)) {
+		/* if index.html (default_page global) exist, serve it, otherwise
+		 * generate directory listing if not disabled.
+		 * */
+		size_t url_len = strlen(conn->url) ;
+		size_t str_len = url_len + strlen(default_page)+2; /* +2 for nullbyte and '/' */
+		char *str = xmalloc(str_len);
+		strcpy(str, conn->url);
+		if(str[url_len-1] != '/') { str[url_len++] = '/';  }
+		strcpy(str+url_len, default_page);
+		
+		if(access(str, F_OK) >= 0) {
+			/* default page exists on this directory. Serve it. */
+			serve_file(conn, str, -1);
+			return;
+		} else {
+			if(listing_disabled) {
+				default_reply(conn, 404); return;
+			} else {
+				serve_directory_listing(conn);
+				return;
+			}
+		}
+		free(str);
+		
+	} else {
+		/* neither a regular file nor a directory. */
+		default_reply(conn, 500); return; 
+	}
+	
+	
+}
+
+static void _process_request_get(struct connection *conn) {
 	struct stat statbuf;
 	const char *content_type;
 		
@@ -586,7 +663,8 @@ static void process_request_get(struct connection *conn) {
 	}
 	
 	/* Only accept regular files. TODO: Support also directory listings. */
-	if(!S_ISREG(statbuf.st_mode)) { default_reply(conn, 404); return; }
+	if(!S_ISREG(statbuf.st_mode)) { 
+		default_reply(conn, 404); return; }
 	
 	// TODO: charset=ISO-8859-1 TODO: CHUNKED ENCODING???
 	
@@ -651,8 +729,7 @@ static void epoll_write_reply_fromem(struct connection *conn) {
     ssize_t nsent;
     
     nsent = write(conn->sock, conn->reply + conn->reply_sent, 
-            //min(SEND_BUFSIZE, 
-            conn->reply_len - conn->reply_sent);//)
+            min(SEND_BUFSIZE, conn->reply_len - conn->reply_sent));
 	
 	if(nsent < 0) {
         if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) { return; }
@@ -692,7 +769,7 @@ terminate_connection:
 
 static void epoll_write_header(struct connection *conn) {
     ssize_t nsent;
-    //fprintf(stderr, ".");
+    
     nsent = write(conn->sock, conn->outheader + conn->outheader_sent, 
             conn->outheader_len - conn->outheader_sent);
     if(nsent < 0) {

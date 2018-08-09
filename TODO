@@ -1,8 +1,24 @@
 Keep-Alive
-Time-Out
-max conn/ip
+serve index.html yes
+refactor url path and serve file code???
+zero length files, how to deal with them? browsers think connection was reset.
+improve Time-Out
+max conn/ip----no
 HTTP Ranges
 If-Modified-Since
 directory listing
 fix logfile
 man tcp TCP_CORK
+chroot
+fix client addr info
+review errorcheck on low level io
+efficiency of reply from mem
+
+tuning
+https://stackoverflow.com/questions/880557/socket-accept-too-many-open-files
+
+all about signals
+http://www.linuxprogrammingblog.com/all-about-linux-signals?page=10
+
+https://stackoverflow.com/questions/17355593/why-is-epoll-faster-than-select/23198432#23198432
+https://idndx.com/2014/09/01/the-implementation-of-epoll-1/
