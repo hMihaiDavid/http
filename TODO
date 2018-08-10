@@ -13,6 +13,7 @@ chroot
 fix client addr info
 review errorcheck on low level io
 efficiency of reply from mem
+iterative heapify
 
 tuning
 https://stackoverflow.com/questions/880557/socket-accept-too-many-open-files

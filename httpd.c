@@ -452,9 +452,17 @@ static struct connection *accept_connection() {
     conn = connection_new();
     conn->sock = socket;
     
+    // TODO test
+    struct timeval tv;
+	tv.tv_sec = 10;  /* 30 Secs Timeout */
+	if(setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO,(struct timeval *)&tv,sizeof(struct timeval)) == -1) {
+		perror("setsockopt(SO_RCVTIMEO)");
+		err(1, "setsockopt(SO_RCVTIMEO)");
+	}
+		
     /* add the newly accepted connection to the epoll interest set */
     ev = (struct epoll_event*)xmalloc(sizeof(struct epoll_event));
-    ev->events = EPOLLIN; /* Since conn->state is RECV_REPLY we are only interested in input events by now. */
+    ev->events = EPOLLIN | EPOLLRDHUP | EPOLLHUP; /* Since conn->state is RECV_REPLY we are only interested in input events by now. */
     ev->data.ptr = (void*)conn; /* so that we can identify the connection when we receive an event */
     conn->ev = ev; /* we store it here so we can free() it when the connection is destroyed */
 
@@ -580,8 +588,9 @@ bad_request:
 
 static void serve_file(struct connection *conn, const char *path, ssize_t size) {
 	struct stat statbuf;
+	const char *content_type;
 	
-	if(size < 0) { /* Obtain size from fs if it is not given. */
+	if(size < 0) { /* Obtain size from fs if it is not precomputed. */
 		if(stat(path, &statbuf) == -1) {
 			if(errno == EACCES) { default_reply(conn, 403); return; }
 			else if(errno == ENOENT) { default_reply(conn, 404); return; }
@@ -589,6 +598,29 @@ static void serve_file(struct connection *conn, const char *path, ssize_t size) 
 		}
 		size = (ssize_t) statbuf.st_size;
 	}
+	
+	/* computing Content-Type based on file extension */
+	ssize_t len = (ssize_t)strlen(path);
+	const char *extension = path+len;
+	while(len >= 0) {
+		if(*extension == '.') break;
+		extension--;
+		len--;
+	}
+	if(len < 0) content_type = "application/octet-stream";
+	else content_type = mime_lookup(++extension);
+	
+	/* Setting the response header */
+	conn->outheader_len = asprintf(&conn->outheader,
+		"HTTP/1.1 200 OK\r\n"
+		"Connection: close\r\n"
+		"Content-Type: %s\r\n"
+		"Content-Length: %lld\r\n"
+		"\r\n"
+		,
+		content_type, (long long)statbuf.st_size);
+	if(conn->outheader_len == -1) { default_reply(conn, 500); return; };
+	
 	
 	/* serve the file */
 	conn->reply_type = REPLY_FROMFILE;
@@ -632,7 +664,7 @@ static void process_request_get(struct connection *conn) {
 		
 		if(access(str, F_OK) >= 0) {
 			/* default page exists on this directory. Serve it. */
-			serve_file(conn, str, -1);
+			serve_file(conn, str, -1); /* -1 means no precomputed size */
 			return;
 		} else {
 			if(listing_disabled) {
@@ -650,56 +682,6 @@ static void process_request_get(struct connection *conn) {
 	}
 	
 	
-}
-
-static void _process_request_get(struct connection *conn) {
-	struct stat statbuf;
-	const char *content_type;
-		
-	if(stat(conn->url, &statbuf) == -1) {
-		if(errno == EACCES) { default_reply(conn, 403); return; }
-		else if(errno == ENOENT) { default_reply(conn, 404); return; }
-		else { default_reply(conn, 500); return; }
-	}
-	
-	/* Only accept regular files. TODO: Support also directory listings. */
-	if(!S_ISREG(statbuf.st_mode)) { 
-		default_reply(conn, 404); return; }
-	
-	// TODO: charset=ISO-8859-1 TODO: CHUNKED ENCODING???
-	
-	ssize_t len = (ssize_t)strlen(conn->url);
-	const char *extension = conn->url+len;
-	while(len >= 0) {
-		if(*extension == '.') break;
-		extension--;
-		len--;
-	}
-	if(len < 0) content_type = "application/octet-stream";
-	else content_type = mime_lookup(extension++);
-	
-	/* Setting the response header */
-	conn->outheader_len = asprintf(&conn->outheader,
-		"HTTP/1.1 200 OK\r\n"
-		"Connection: close\r\n"
-		"Content-Type: %s\r\n"
-		"Content-Length: %lld\r\n"
-		"\r\n"
-		,
-		content_type, (long long)statbuf.st_size);
-	if(conn->outheader_len == -1) { default_reply(conn, 500); return; }
-	
-	if(conn->method == METHOD_HEAD) return; /* Nothing more to do */
-	
-	/* serve the file */
-	conn->reply_type = REPLY_FROMFILE;
-	conn->reply_len = (size_t) statbuf.st_size;
-	conn->reply_fd = open(conn->url, O_RDONLY);
-	if(conn->reply_fd == -1) {
-		if(errno == EACCES) { default_reply(conn, 403); return; }
-		else if(errno == ENOENT) { default_reply(conn, 404); return; }
-		else { default_reply(conn, 500); return; }
-	}
 }
 
 /* All data has been read, now it's time to process it 
@@ -821,8 +803,11 @@ static void epoll_read(struct connection *conn) {
     nread = read(conn->sock, conn->input_buffer + conn->input_len
             , RECV_BUFSIZE);
     if(nread < 0) {
-        if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+		perror("read()");
+        if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+			
 			return;
+		}	
         else if(errno == ECONNRESET)
             goto terminate_connection; 
         else err(1, "read() in epoll_read()");
@@ -875,8 +860,8 @@ terminate_connection:
 static void handle_socket_io_event(struct connection *conn) {
 	
 	if(now - conn->last_active > maxidle) {
-		DEBUG_PRINT("Connection maxidle exceeded.\n");
-		conn->state = STATE_INVALID;
+		//DEBUG_PRINT("Connection maxidle exceeded.\n");
+		//conn->state = STATE_INVALID;
 	} else conn->last_active = now;
 	
 	switch(conn->state) {
@@ -929,6 +914,8 @@ static void httpd_epoll(void){
              * The connection is in the data.ptr of the event.
              * */
             conn = (struct connection *) evlist[i].data.ptr;
+            if(evlist[i].events & EPOLLRDHUP) DEBUG_PRINT("Got EPOLLRDHUP\n");
+            if(evlist[i].events & EPOLLHUP) DEBUG_PRINT("Got EPOLLHUP\n");
             handle_socket_io_event(conn);
 
         }
