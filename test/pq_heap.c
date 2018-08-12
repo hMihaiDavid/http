@@ -70,7 +70,7 @@ int pq_remove(pq_heap_t *heap, struct connection* conn) {
 }
 
 void pq_add(pq_heap_t *heap, struct connection* conn) {
-	if(heap->size == heap->data_len) _pq_realloc(heap, heap->grow_rate);
+	if(heap->size == heap->data_len-1) _pq_realloc(heap, heap->grow_rate);
 	heap->data[++heap->size] = conn;
 	_pq_decrease_key(heap, heap->size);
 }
