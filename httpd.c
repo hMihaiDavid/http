@@ -58,6 +58,37 @@
 #include <sys/sysinfo.h> 
 #include <time.h>
 
+
+static void err(int errcode, char *errmsg) {
+    fprintf(stderr, "Error: %s\n", errmsg);
+    exit(errcode);
+}
+
+static void xerr(int errcode, char *errmsg, int errno) {
+    // TODO
+}
+
+/*
+ * Error checked wrappers around malloc() and realloc()
+ * */
+static void *xmalloc(size_t size) {
+    void *p = malloc(size);
+    if(p == NULL)
+        err(1, "malloc() failed. Big trouble.");
+    return p;
+}
+static void *xrealloc(void *ptr, size_t size) {
+    void *p = realloc(ptr, size);
+    if(p == NULL)
+        err(1, "realloc() failed. Big trouble.");
+    return p;
+}
+
+static ssize_t min(ssize_t a, ssize_t b) {
+    return a < b ? a : b;
+}
+
+
 /* Object representing a connection being processed.
  * Functions: connection_new(), connection_free()
  * */
@@ -117,7 +148,109 @@ struct connection {
     
     /* If reply_type is REPLY_FROMFILE, this is the filedesc from which to serve the request. */
     int reply_fd;
+    
+    /* index of this connection in the priority queue internal array. Used for efficient removal. */
+    size_t heapindex;
 };
+
+
+/* <--------- Priority Queue (MinHeap) implementation. 
+ * 
+ * */
+ 
+ typedef struct pq_heap_t {
+	size_t size; /* Number of elements */
+	struct connection **data; /* Growing array that stores the heap. */
+	size_t data_len; /* Length of data array. */
+	size_t grow_rate; /* how many element slots to grow when more space is needed. */
+} pq_heap_t;
+
+/* private methods */
+void _pq_realloc(pq_heap_t *heap, size_t block_len) {
+	
+	heap->data = xrealloc(heap->data, (heap->data_len+block_len)*sizeof(struct connection *));
+	heap->data_len += block_len;
+}
+
+void _pq_swap(pq_heap_t *heap, size_t i, size_t j) {
+	heap->data[i]->heapindex = j;
+	heap->data[j]->heapindex = i;
+	struct connection *tmp = heap->data[j];
+	heap->data[j] = heap->data[i];
+	heap->data[i] = tmp;
+}
+
+void _pq_min_heapify(pq_heap_t *heap, size_t i) {
+	size_t l = i << 1;
+	size_t r = l + 1;
+	size_t smallest=i;
+	
+	if(l <= heap->size && heap->data[l]->last_active <  heap->data[smallest]->last_active) smallest = l;
+	if(r <= heap->size && heap->data[r]->last_active <  heap->data[smallest]->last_active) smallest = r;
+	
+	if(smallest != i) {
+		_pq_swap(heap, i, smallest);
+		
+		_pq_min_heapify(heap, smallest);
+	}
+}
+
+void _pq_decrease_key(pq_heap_t *heap, size_t i) {
+	size_t p = i >> 1;
+	while(i > 1 && heap->data[i]->last_active < heap->data[p]->last_active) {
+		_pq_swap(heap, i, p);
+		
+		i = p;
+		p = i >> 1;
+	}
+}
+
+void pq_init(pq_heap_t *heap,size_t initial_size, size_t grow_rate) {
+	
+	/* Default values. */
+	if(initial_size == 0) initial_size = 1000;
+	if(grow_rate == 0) grow_rate = 100;
+	
+	heap->data = xmalloc((initial_size+1)*sizeof(struct connection*));
+	heap->size = 0;
+	heap->data_len = initial_size+1;
+	heap->grow_rate = grow_rate;
+	
+	return heap;
+	
+}
+
+struct connection *pq_peek(pq_heap_t *heap) {
+	return heap->size > 0 ? heap->data[1] : NULL;
+}
+
+int pq_remove(pq_heap_t *heap, struct connection* conn) {
+	size_t i = conn->heapindex;
+	
+	if(heap->data[i] == conn) {
+		heap->data[i] = heap->data[heap->size];
+		heap->data[i]->heapindex = i;
+		heap->data[heap->size] = NULL;
+		conn->heapindex = 0;
+		heap->size--;
+		_pq_min_heapify(heap, i);
+		_pq_decrease_key(heap, i);
+		return 1;
+	}
+
+	return 0;
+}
+
+void pq_add(pq_heap_t *heap, struct connection* conn) {
+	if(heap->size == heap->data_len-1) _pq_realloc(heap, heap->grow_rate);
+		
+	heap->data[++heap->size] = conn;
+	conn->heapindex = heap->size;
+	_pq_decrease_key(heap, heap->size);
+}
+
+/* <----------------- END Priority Queue implementation. */
+
 
 /* --- GLOBALS --- */
 const char *www_path = NULL; /* path to the www directory to serve. */
@@ -180,35 +313,6 @@ static const char *mime_table[] = {
 };
 
 /* --- END GLOBALS --- */
-
-static void err(int errcode, char *errmsg) {
-    fprintf(stderr, "Error: %s\n", errmsg);
-    exit(errcode);
-}
-
-static void xerr(int errcode, char *errmsg, int errno) {
-    // TODO
-}
-
-/*
- * Error checked wrappers around malloc() and realloc()
- * */
-static void *xmalloc(size_t size) {
-    void *p = malloc(size);
-    if(p == NULL)
-        err(1, "malloc() failed. Big trouble.");
-    return p;
-}
-static void *xrealloc(void *ptr, size_t size) {
-    void *p = realloc(ptr, size);
-    if(p == NULL)
-        err(1, "realloc() failed. Big trouble.");
-    return p;
-}
-
-static ssize_t min(ssize_t a, ssize_t b) {
-    return a < b ? a : b;
-}
 
 static void print_help(char *program_name) {
 #define SOME_TABS "\t\t\t\t"
@@ -326,6 +430,7 @@ static struct connection* connection_new() {
     conn->reply_sent = 0;
     
     conn->reply_fd = -1;
+    conn->heapindex = 0;
 
     conn->client_ip = NULL;
     conn->client_port = 0;
@@ -452,14 +557,6 @@ static struct connection *accept_connection() {
     conn = connection_new();
     conn->sock = socket;
     
-    // TODO test
-    struct timeval tv;
-	tv.tv_sec = 10;  /* 30 Secs Timeout */
-	if(setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO,(struct timeval *)&tv,sizeof(struct timeval)) == -1) {
-		perror("setsockopt(SO_RCVTIMEO)");
-		err(1, "setsockopt(SO_RCVTIMEO)");
-	}
-		
     /* add the newly accepted connection to the epoll interest set */
     ev = (struct epoll_event*)xmalloc(sizeof(struct epoll_event));
     ev->events = EPOLLIN | EPOLLRDHUP | EPOLLHUP; /* Since conn->state is RECV_REPLY we are only interested in input events by now. */
@@ -476,6 +573,7 @@ static struct connection *accept_connection() {
     conn->client_port = client_addr.sin_port;
 	*/
     open_connections++;
+    pq_add(&connqueue, conn);
     DEBUG_PRINT("Accepted connection from %s:%d\n", conn->client_ip,
             conn->client_port);
     return conn;
@@ -488,6 +586,7 @@ static void destroy_connection(struct connection *conn) {
     if(conn->sock > -1) close(conn->sock);
     if(conn->reply_fd > -1) close(conn->reply_fd);
     open_connections--;
+    pq_remove(&connqueue, conn);
     DEBUG_PRINT("Connection closed %s:%d\n", conn->client_ip, 
             conn->client_port);
     connection_free(conn);
