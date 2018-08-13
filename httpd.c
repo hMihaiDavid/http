@@ -7,7 +7,7 @@
 
 #define RECV_BUFSIZE 512 /* how much data to read() from socket at once */
 #define SEND_BUFSIZE 1024 /* how much data to write() at once from memory (if reply is on memory) */
-#define SENDFILE_COUNT 2048 /* how much data to send at once from file if reply is a file (normally )*/
+#define SENDFILE_COUNT 2048 /* how much data to send at once from file if reply is a file */
 #define HTTP_MAXREQUESTSIZE 8*1024 /* 8K just like Apache. */
 
 /* DEFAULT REPLIES FOR ERROR CODES. FEEL FREE TO MODIFY REPLY_XXX */
@@ -264,6 +264,7 @@ int is_parent = 1; /* boolean */
 //static size_T nbytes_served;
 /* Current seconds since epoch, updated each iteration of epoll loop. Use for timing out idle connections */
 time_t now = -1;
+pq_heap_t connqueue;
 
 
 /* Config variables. They can be overriden by command line options */
@@ -573,6 +574,7 @@ static struct connection *accept_connection() {
     conn->client_port = client_addr.sin_port;
 	*/
     open_connections++;
+    conn->last_active = now;
     pq_add(&connqueue, conn);
     DEBUG_PRINT("Accepted connection from %s:%d\n", conn->client_ip,
             conn->client_port);
@@ -957,12 +959,7 @@ terminate_connection:
 }
 
 static void handle_socket_io_event(struct connection *conn) {
-	
-	if(now - conn->last_active > maxidle) {
-		//DEBUG_PRINT("Connection maxidle exceeded.\n");
-		//conn->state = STATE_INVALID;
-	} else conn->last_active = now;
-	
+		
 	switch(conn->state) {
 		case STATE_RECV:
             epoll_read(conn);
@@ -994,6 +991,8 @@ static void httpd_epoll(void){
     int nfds_ready;
     struct epoll_event evlist[MAX_EVENTS];
     struct connection *conn;
+    
+	now = time(NULL);
 
     nfds_ready = epoll_wait(epoll_set, evlist, MAX_EVENTS, -1);
 
@@ -1002,7 +1001,6 @@ static void httpd_epoll(void){
         else err(1, "epoll_wait()");
     }
 
-	now = time(NULL);
     for(size_t i=0; i<nfds_ready; i++) {
         if(evlist[i].data.ptr == NULL) { /* New connection to accept */
             conn = accept_connection();
@@ -1015,6 +1013,7 @@ static void httpd_epoll(void){
             conn = (struct connection *) evlist[i].data.ptr;
             if(evlist[i].events & EPOLLRDHUP) DEBUG_PRINT("Got EPOLLRDHUP\n");
             if(evlist[i].events & EPOLLHUP) DEBUG_PRINT("Got EPOLLHUP\n");
+            conn->last_active = now;
             handle_socket_io_event(conn);
 
         }
@@ -1047,6 +1046,8 @@ int main(int argc, char **argv) {
             logfile = stdout;
         }
     }
+    
+    pq_init(&connqueue, 1000,1000);
 
     /* Signal handling */
 #ifdef DEBUG
