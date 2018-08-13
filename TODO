@@ -2,7 +2,7 @@ Keep-Alive
 serve index.html yes
 refactor url path and serve file code???
 zero length files, how to deal with them? browsers think connection was reset.
-improve Time-Out
+write tester for timeout and check for int overflow.
 max conn/ip----no
 HTTP Ranges
 If-Modified-Since

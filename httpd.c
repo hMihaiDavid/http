@@ -99,6 +99,7 @@ struct connection {
     char *client_ip;
 
 	time_t last_active;
+	int skip_timeout;
 
     enum {
         STATE_INVALID,
@@ -235,10 +236,10 @@ int pq_remove(pq_heap_t *heap, struct connection* conn) {
 		heap->size--;
 		_pq_min_heapify(heap, i);
 		_pq_decrease_key(heap, i);
-		return 1;
+		return 0;
 	}
 
-	return 0;
+	return -1;
 }
 
 void pq_add(pq_heap_t *heap, struct connection* conn) {
@@ -247,6 +248,11 @@ void pq_add(pq_heap_t *heap, struct connection* conn) {
 	heap->data[++heap->size] = conn;
 	conn->heapindex = heap->size;
 	_pq_decrease_key(heap, heap->size);
+}
+
+void pq_update(pq_heap_t *heap, struct connection* conn) {
+	_pq_min_heapify(heap, conn->heapindex);
+	_pq_decrease_key(heap, conn->heapindex);
 }
 
 /* <----------------- END Priority Queue implementation. */
@@ -271,7 +277,7 @@ pq_heap_t connqueue;
 static int port = 8080;                 /* port to listen to */
 static const char *bindaddr_str = NULL; /* Bind interface. Default: NULL: 0.0.0.0 */
 static int sockserv_backlog = -1; /* somaxconn TODO:*/
-time_t maxidle = 60; /* if a connection is idle for this many seconds or more, it's terminated.*/
+time_t maxidle = 10; /* if a connection is idle for this many seconds or more, it's terminated.*/
 static int workers = 0;
 const char *default_page = "index.html";
 int listing_disabled = 0; /* boolean */
@@ -412,6 +418,7 @@ static struct connection* connection_new() {
     conn->reply_type = REPLY_FROMMEM;
     conn->default_reply = 0;
 	conn->last_active = now;
+	conn->skip_timeout = 1;
 	
     conn->url = NULL;
     conn->host = NULL;
@@ -574,6 +581,7 @@ static struct connection *accept_connection() {
     conn->client_port = client_addr.sin_port;
 	*/
     open_connections++;
+    //now = time(NULL);
     conn->last_active = now;
     pq_add(&connqueue, conn);
     DEBUG_PRINT("Accepted connection from %s:%d\n", conn->client_ip,
@@ -588,7 +596,7 @@ static void destroy_connection(struct connection *conn) {
     if(conn->sock > -1) close(conn->sock);
     if(conn->reply_fd > -1) close(conn->reply_fd);
     open_connections--;
-    pq_remove(&connqueue, conn);
+    if(pq_remove(&connqueue, conn) < 0) err(1, "pq_remove()");
     DEBUG_PRINT("Connection closed %s:%d\n", conn->client_ip, 
             conn->client_port);
     connection_free(conn);
@@ -990,16 +998,30 @@ static void handle_socket_io_event(struct connection *conn) {
 static void httpd_epoll(void){
     int nfds_ready;
     struct epoll_event evlist[MAX_EVENTS];
-    struct connection *conn;
-    
-	now = time(NULL);
-
-    nfds_ready = epoll_wait(epoll_set, evlist, MAX_EVENTS, -1);
-
+    struct connection *conn, *head;
+    int timeout;
+    	
+	head = pq_peek(&connqueue);
+	if(head == NULL) timeout = -1;
+	else {
+		head->skip_timeout  = 0;
+		timeout = (int)( (maxidle - (now - head->last_active))*1000 );
+		if(timeout < 0) timeout = 0; /* time out immediately and to the work. */
+	}
+		
+    nfds_ready = epoll_wait(epoll_set, evlist, MAX_EVENTS, timeout);
+    now = time(NULL);
     if(nfds_ready == -1) {
         if(errno == EINTR){ return; }
         else err(1, "epoll_wait()");
-    }
+    } else if(nfds_ready == 0) {
+		/* epoll_wait timeout */
+		if(!head->skip_timeout){
+			DEBUG_PRINT("epoll timeout (%p)\n", head);
+			head->state = STATE_DONE;
+			destroy_connection(head);
+		}
+	}
 
     for(size_t i=0; i<nfds_ready; i++) {
         if(evlist[i].data.ptr == NULL) { /* New connection to accept */
@@ -1013,7 +1035,9 @@ static void httpd_epoll(void){
             conn = (struct connection *) evlist[i].data.ptr;
             if(evlist[i].events & EPOLLRDHUP) DEBUG_PRINT("Got EPOLLRDHUP\n");
             if(evlist[i].events & EPOLLHUP) DEBUG_PRINT("Got EPOLLHUP\n");
+            conn->skip_timeout = 0; /* in case conn has been scheduled for timeout, we postpone it.*/
             conn->last_active = now;
+            pq_update(&connqueue, conn);
             handle_socket_io_event(conn);
 
         }
@@ -1046,8 +1070,6 @@ int main(int argc, char **argv) {
             logfile = stdout;
         }
     }
-    
-    pq_init(&connqueue, 1000,1000);
 
     /* Signal handling */
 #ifdef DEBUG
@@ -1090,7 +1112,9 @@ int main(int argc, char **argv) {
 		}
 	}
 	
+	pq_init(&connqueue, 1000,1000); /* every worker has its own connqueue */
     epoll_init();   /* initialize epoll set and add sockserv to it.*/
+    now = time(NULL);
     
     while(running) httpd_epoll(); /* Event loop */
     

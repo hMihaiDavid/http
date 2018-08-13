@@ -120,6 +120,11 @@ void pq_add(pq_heap_t *heap, struct connection* conn) {
 	_pq_decrease_key(heap, heap->size);
 }
 
+void pq_update(pq_heap_t *heap, struct connection* conn) {
+	_pq_min_heapify(heap, conn->heapindex);
+	_pq_decrease_key(heap, conn->heapindex);
+}
+
 
 int main() {
 	
