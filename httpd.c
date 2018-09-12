@@ -358,11 +358,12 @@ static void connection_free(struct connection *conn) {
  * "application/octet-stream" is returned.
  * */
 static const char *mime_lookup(const char *extension) {
+	DEBUG_PRINT("ext: %s\n", extension);
 	while(*extension != '\0' && *extension == '.') extension++;
 	
 	char **t = mime_table;
 	while(*t != NULL) {
-		if(strstr(*t, extension) != NULL) return t[1];
+		if(strstr(*t, extension) != NULL) { return t[1];}
 		t+=2;
 	}
 	return "application/octet-stream";
@@ -589,6 +590,32 @@ static void serve_file(struct connection *conn, const char *path, ssize_t size) 
 		}
 		size = (ssize_t) statbuf.st_size;
 	}
+	
+	/* 
+	 * 
+	 * */
+	 
+	 DEBUG_PRINT("%s\n", path);
+	 
+	/* Setting the response header */
+	char *p = path;
+	while(*p)p++;
+	while(p != path && *p != '.') p--;
+	
+	char *content_type;
+	if(p == path) content_type = "application/octet-stream";
+	else content_type = mime_lookup(p);
+	
+	conn->outheader_len = asprintf(&conn->outheader,
+		"HTTP/1.1 200 OK\r\n"
+		"Connection: close\r\n"
+		"Content-Type: %s\r\n"
+		"Content-Length: %lld\r\n"
+		"\r\n"
+		,
+		content_type,
+		size
+		);
 	
 	/* serve the file */
 	conn->reply_type = REPLY_FROMFILE;
