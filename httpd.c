@@ -92,6 +92,8 @@ struct connection {
     } method;
 
     char *url;
+    char *path;
+    struct stat *statbuf;
     char *host;
     char *user_agent;
     char *referer;
@@ -309,6 +311,8 @@ static struct connection* connection_new() {
 	conn->last_active = now;
 	
     conn->url = NULL;
+    conn->path = NULL;
+    conn->statbuf = NULL;
     conn->host = NULL;
     conn->user_agent = NULL;
     conn->referer = NULL;
@@ -341,6 +345,8 @@ static void connection_free(struct connection *conn) {
     }
     free(conn->ev);
     free(conn->client_ip);
+    free(conn->statbuf);
+    free(conn->path);
     /* // No need to free these ones cause they point inside input_buffer 
      * // for efficiency.
      
@@ -579,31 +585,15 @@ bad_request:
 	return;
 }
 
-static void serve_file(struct connection *conn, const char *path, ssize_t size) {
-	struct stat statbuf;
+static void serve_file(struct connection *conn) {
 	
-	if(size < 0) { /* Obtain size from fs if it is not given. */
-		if(stat(path, &statbuf) == -1) {
-			if(errno == EACCES) { default_reply(conn, 403); return; }
-			else if(errno == ENOENT) { default_reply(conn, 404); return; }
-			else { default_reply(conn, 500); return; }
-		}
-		size = (ssize_t) statbuf.st_size;
-	}
-	
-	/* 
-	 * 
-	 * */
-	 
-	 DEBUG_PRINT("%s\n", path);
-	 
 	/* Setting the response header */
-	char *p = path;
+	char *p = conn->path;
 	while(*p)p++;
-	while(p != path && *p != '.') p--;
+	while(p != conn->path && *p != '.') p--;
 	
 	char *content_type;
-	if(p == path) content_type = "application/octet-stream";
+	if(p == conn->path) content_type = "application/octet-stream";
 	else content_type = mime_lookup(p);
 	
 	conn->outheader_len = asprintf(&conn->outheader,
@@ -614,13 +604,13 @@ static void serve_file(struct connection *conn, const char *path, ssize_t size) 
 		"\r\n"
 		,
 		content_type,
-		size
+		conn->statbuf->st_size
 		);
 	
 	/* serve the file */
 	conn->reply_type = REPLY_FROMFILE;
-	conn->reply_len = (size_t) size;
-	conn->reply_fd = open(path, O_RDONLY);
+	conn->reply_len = (size_t) conn->statbuf->st_size;
+	conn->reply_fd = open(conn->path, O_RDONLY);
 	if(conn->reply_fd == -1) {
 		if(errno == EACCES) { default_reply(conn, 403); return; }
 		else if(errno == ENOENT) { default_reply(conn, 404); return; }
@@ -634,19 +624,24 @@ static void serve_directory_listing(struct connection *conn) {
 }
 
 static void process_request_get(struct connection *conn) {
-	struct stat statbuf;
+	
 	const char *content_type;
 	
-	if(stat(conn->url, &statbuf) == -1) {
+    conn->statbuf = (struct stat*) xmalloc(sizeof(struct stat));
+
+	if(stat(conn->url, conn->statbuf) == -1) {
 		if(errno == EACCES) { default_reply(conn, 403); return; }
 		else if(errno == ENOENT) { default_reply(conn, 404); return; }
 		else { default_reply(conn, 500); return; }
 	}
 	
-	if(S_ISREG(statbuf.st_mode)) {
-		serve_file(conn, conn->url, (ssize_t)statbuf.st_size); 
-		return;
-	} else if(S_ISDIR(statbuf.st_mode)) {
+	if(S_ISREG(conn->statbuf->st_mode)) {
+        conn->path = conn->url;
+		serve_file(conn); 
+		conn->path = NULL;
+        free(conn->statbuf); conn->statbuf = NULL;
+        return;
+	} else if(S_ISDIR(conn->statbuf->st_mode)) {
 		/* if index.html (default_page global) exist, serve it, otherwise
 		 * generate directory listing if not disabled.
 		 * */
@@ -659,7 +654,11 @@ static void process_request_get(struct connection *conn) {
 		
 		if(access(str, F_OK) >= 0) {
 			/* default page exists on this directory. Serve it. */
-			serve_file(conn, str, -1);
+			conn->path = str;
+            serve_file(conn);
+            conn->path = NULL; free(str);
+            free(conn->statbuf); conn->statbuf = NULL;
+            
 			return;
 		} else {
 			if(listing_disabled) {
@@ -669,7 +668,6 @@ static void process_request_get(struct connection *conn) {
 				return;
 			}
 		}
-		free(str);
 		
 	} else {
 		/* neither a regular file nor a directory. */
@@ -677,56 +675,6 @@ static void process_request_get(struct connection *conn) {
 	}
 	
 	
-}
-
-static void _process_request_get(struct connection *conn) {
-	struct stat statbuf;
-	const char *content_type;
-		
-	if(stat(conn->url, &statbuf) == -1) {
-		if(errno == EACCES) { default_reply(conn, 403); return; }
-		else if(errno == ENOENT) { default_reply(conn, 404); return; }
-		else { default_reply(conn, 500); return; }
-	}
-	
-	/* Only accept regular files. TODO: Support also directory listings. */
-	if(!S_ISREG(statbuf.st_mode)) { 
-		default_reply(conn, 404); return; }
-	
-	// TODO: charset=ISO-8859-1 TODO: CHUNKED ENCODING???
-	
-	ssize_t len = (ssize_t)strlen(conn->url);
-	const char *extension = conn->url+len;
-	while(len >= 0) {
-		if(*extension == '.') break;
-		extension--;
-		len--;
-	}
-	if(len < 0) content_type = "application/octet-stream";
-	else content_type = mime_lookup(extension++);
-	
-	/* Setting the response header */
-	conn->outheader_len = asprintf(&conn->outheader,
-		"HTTP/1.1 200 OK\r\n"
-		"Connection: close\r\n"
-		"Content-Type: %s\r\n"
-		"Content-Length: %lld\r\n"
-		"\r\n"
-		,
-		content_type, (long long)statbuf.st_size);
-	if(conn->outheader_len == -1) { default_reply(conn, 500); return; }
-	
-	if(conn->method == METHOD_HEAD) return; /* Nothing more to do */
-	
-	/* serve the file */
-	conn->reply_type = REPLY_FROMFILE;
-	conn->reply_len = (size_t) statbuf.st_size;
-	conn->reply_fd = open(conn->url, O_RDONLY);
-	if(conn->reply_fd == -1) {
-		if(errno == EACCES) { default_reply(conn, 403); return; }
-		else if(errno == ENOENT) { default_reply(conn, 404); return; }
-		else { default_reply(conn, 500); return; }
-	}
 }
 
 /* All data has been read, now it's time to process it 

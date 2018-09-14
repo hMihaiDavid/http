@@ -1,2 +1,2 @@
 all:
-	gcc httpd.c -o httpd -ggdb -DDEBUG
+	cc httpd.c -o httpd -std=c99 -ggdb -DDEBUG
