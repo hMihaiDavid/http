@@ -68,6 +68,7 @@ struct connection {
     char *client_ip;
 
 	time_t last_active;
+	time_t ifmodsince;
 
     enum {
         STATE_INVALID,
@@ -97,7 +98,10 @@ struct connection {
     char *host;
     char *user_agent;
     char *referer;
-
+    
+    int headers_only; /* flag, if set only headers are sent. Like in HEAD */
+	int old_http;	/* flag, if set request is HTTP/1.0 instead of 1.1 */
+	
     char *input_buffer; /* Buffer where we store input data before 
                            processing headers. Grows dynamically in multiples of RECV_BUFSIZE */
     size_t input_len;    /* bytes read into request buffer */
@@ -309,6 +313,9 @@ static struct connection* connection_new() {
     conn->reply_type = REPLY_FROMMEM;
     conn->default_reply = 0;
 	conn->last_active = now;
+	conn->ifmodsince = (time_t)-1;
+	conn->headers_only = 0;
+	conn->old_http = 0;
 	
     conn->url = NULL;
     conn->path = NULL;
@@ -550,10 +557,69 @@ static void parse_http_method(struct connection *conn, char *str) {
     }
 }
 
+static int parse_ifmodsince(struct connection *conn, const char *date_str) {
+	struct tm broken_down;
+	time_t result;
+	
+	fprintf("PARSING IFMODSINCE -->%s\n", date_str);
+	if(strptime(date_str, 
+		"%a, %d %b %Y %H:%M:%S GMT",
+		&broken_down
+	) == NULL) return -1;
+	
+	if((result = timegm(&broken_down)) < == -1) return -1;
+	conn->ifmodsince = result;
+		
+	return 0;
+}
+
+static char *get_lastmodstr(time_t t) {
+#define RESULT_STR_SIZE 32
+
+	struct tm broken_down;
+	char *result = xmalloc(RESULT_STR_SIZE);
+	
+	if(gmtime_r(&t, &broken_down) == NULL) return NULL;
+	if(strftime(result, RESULT_STR_SIZE,
+				"%a, %d %b %Y %H:%M:%S GMT",
+				&broken_down) == 0)
+		return NULL;
+
+	return result;
+#undef RESULT_STR_SIZE
+}
+
+static int parse_field_line(struct connection *conn, const char *field_line) {
+	const char *key = field_line;
+	char *value = key;
+	
+	while(*key != '\0' && isspace(*key)) key++;
+	if(*value == '\0') return 0; /* skip a null field line */
+	while(*value != '\0' && *value != ':') value++;
+	if(*value == '\0') return -1; /* error */
+	*value = '\0'; value++;
+	while(*value != '\0' && isspace(*value)) value++;
+	//fprintf(stderr, "\n%s-->%s\n", key, value);
+	
+	if(strcmp(key, "Host") == 0) {
+		conn->host = value;
+	} else if(strcmp(key, "User-Agent") == 0) {
+		conn->user_agent = value;
+	} else if(strcmp(key, "Referer") == 0) {
+		conn->referer = value;
+	} else if(strcmp(key, "Connection") == 0) {
+		// TODO
+	} else if(strcmp(key, "If-Modified-Since") == 0) {
+		if(parse_ifmodsince(conn, value) < 0) return -1;
+	}
+	
+	return 0;
+}
+
 /* TODO: MAKE SURE IT'S MEMORY SAFE */
 static void parse_input(struct connection *conn) {
     char *p, c;
-
+    fprintf(stderr, "%s\n", conn->input_buffer);
     /* parse method */
     p = conn->input_buffer;
     while(*p != '\0' && !isblank(*p)) p++;
@@ -571,14 +637,33 @@ static void parse_input(struct connection *conn) {
     if(*p == '\0') goto bad_request;
     *p = '\0'; /* terminate url */
     if(conn->url[0] == '/' && conn->url[1] == '\0')
-		conn->url[0] = '.';
-	else while(*(conn->url) == '/') conn->url++;
-    p++;
-    
+		conn->url[0] = '.'; // TODO check this
+	else while(*(conn->url) == '/') conn->url++;   
     if(!parse_url(conn)) goto bad_request;
+    p++;
+    while(*p != '\0' && isblank(*p) ) p++;
+    
+    /* Detect HTTP/1.0 or HTTP/1.1 */
+    
+    const char *proto = p;
+    while(*p != '\0' && *p != '\n') p++;
+    *p = '\0';
+    p++;
+    if(strcmp(proto, "HTTP/1.0") == 0) conn->old_http = 1;
+    else if (strcmp(proto, "HTTP/1.1") == 0) conn->old_http = 0;
+    //else goto bad_request;
         
+    /* process header fields */
+    const char *q = p;
+	while(*p != '\0') {
+		if(p[0] == '\r' && p[1] == '\n') {
+			p[0] = '\0'; p += 2;
+			if(parse_field_line(conn, q) < 0) goto bad_request;
+			q = p;
+		} else p++;
+	}
+    
     return;
-    // TODO: parse header lines (Host, Referer, User-Agent, ...)
     
 bad_request:
 	default_reply(conn, 400);
@@ -586,6 +671,9 @@ bad_request:
 }
 
 static void serve_file(struct connection *conn) {
+	
+	DEBUG_PRINT("st_mtime = %d\n", 
+		conn->statbuf->st_mtime);
 	
 	/* Setting the response header */
 	char *p = conn->path;
@@ -596,16 +684,23 @@ static void serve_file(struct connection *conn) {
 	if(p == conn->path) content_type = "application/octet-stream";
 	else content_type = mime_lookup(p);
 	
+	char *last_modified_str;
+	if((last_modified_str = get_lastmodstr(conn->statbuf->st_mtime)) == NULL)  {
+		default_reply(conn, 500); return; 
+	}
 	conn->outheader_len = asprintf(&conn->outheader,
 		"HTTP/1.1 200 OK\r\n"
 		"Connection: close\r\n"
 		"Content-Type: %s\r\n"
 		"Content-Length: %lld\r\n"
+		"Last-Modified: %s\r\n"
 		"\r\n"
 		,
 		content_type,
-		conn->statbuf->st_size
+		conn->statbuf->st_size,
+		last_modified_str
 		);
+	free(last_modified_str);
 	
 	/* serve the file */
 	conn->reply_type = REPLY_FROMFILE;
@@ -640,7 +735,6 @@ static void process_request_get(struct connection *conn) {
 		serve_file(conn); 
 		conn->path = NULL;
         free(conn->statbuf); conn->statbuf = NULL;
-        return;
 	} else if(S_ISDIR(conn->statbuf->st_mode)) {
 		/* if index.html (default_page global) exist, serve it, otherwise
 		 * generate directory listing if not disabled.
@@ -655,17 +749,20 @@ static void process_request_get(struct connection *conn) {
 		if(access(str, F_OK) >= 0) {
 			/* default page exists on this directory. Serve it. */
 			conn->path = str;
+			if(stat(conn->path, conn->statbuf) == -1) {
+				if(errno == EACCES) { default_reply(conn, 403); return; }
+				else if(errno == ENOENT) { default_reply(conn, 404); return; }
+				else { default_reply(conn, 500); return; }
+			}
             serve_file(conn);
             conn->path = NULL; free(str);
             free(conn->statbuf); conn->statbuf = NULL;
             
-			return;
 		} else {
 			if(listing_disabled) {
-				default_reply(conn, 404); return;
+				default_reply(conn, 404);
 			} else {
 				serve_directory_listing(conn);
-				return;
 			}
 		}
 		
@@ -673,8 +770,6 @@ static void process_request_get(struct connection *conn) {
 		/* neither a regular file nor a directory. */
 		default_reply(conn, 500); return; 
 	}
-	
-	
 }
 
 /* All data has been read, now it's time to process it 
@@ -683,6 +778,9 @@ static void process_request_get(struct connection *conn) {
  * */
 static void process_request(struct connection *conn) {
     parse_input(conn);
+    /*if(!conn->old_http && (conn->host == NULL || *(conn->host) == '\0'))
+		default_reply(conn, 400);*/
+	
     if(conn->default_reply) return;
     
     switch(conn->method) {
@@ -690,6 +788,7 @@ static void process_request(struct connection *conn) {
 			process_request_get(conn);
 			break;
 		case METHOD_HEAD:
+			conn->headers_only = 1;
 			process_request_get(conn);
 			break;
 		case METHOD_INVALID:
@@ -757,7 +856,7 @@ static void epoll_write_header(struct connection *conn) {
     
     conn->outheader_sent += nsent;
     if(conn->outheader_sent == conn->outheader_len) {
-        if(conn->method == METHOD_HEAD)
+        if(conn->headers_only)
 			goto terminate_connection;
 		else
 			conn->state = STATE_SEND_REPLY;
@@ -781,14 +880,14 @@ static void epoll_read(struct connection *conn) {
     ssize_t nread;
     size_t available;
 
-    /* Make sure there are RECV_BUFSIZE available space 
+    /* Make sure there are RECV_BUFSIZE+1 available space 
      * in conn->input_buffer before a read;
      * */
     available = conn->input_bufsize - conn->input_len;
-    if(available < RECV_BUFSIZE) {
+    if(available < RECV_BUFSIZE+1) { /* +1 for the terminating nullbyte. */
         conn->input_buffer = xrealloc(conn->input_buffer, 
-                conn->input_bufsize + RECV_BUFSIZE);
-        conn->input_bufsize += RECV_BUFSIZE;
+                conn->input_bufsize + RECV_BUFSIZE+1);
+        conn->input_bufsize += RECV_BUFSIZE+1;
     }
     /* END DYNAMICALLY GROWING THE BUFFER */
 
@@ -831,6 +930,7 @@ static void epoll_read(struct connection *conn) {
 	return;
 
 all_request_in_buffer:
+	conn->input_buffer[conn->input_len] = '\0';
     process_request(conn);
     
     /* From now on we are only interested in write events from this connection */ 

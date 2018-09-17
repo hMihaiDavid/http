@@ -1,5 +1,5 @@
 Keep-Alive
-serve index.html yes
+refactor statbuf
 refactor url path and serve file code???
 zero length files, how to deal with them? browsers think connection was reset.
 improve Time-Out
