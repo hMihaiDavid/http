@@ -23,6 +23,7 @@
 #define REPLY_500 "<!DOCTYPE html><html><head><title>500 Internal Server Error</title></head><body><h1>500 Internal Server Error</h1><p>An error has occurred while processing your request.</p></body></html>"
 #define HEADER_500 "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n"
 
+#define HEADER_304 "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n"
 
 #ifndef NO_IPV6 /* TODO: Add IPv6 support */
 #   define HAVE_INET6
@@ -523,6 +524,13 @@ static void default_reply(struct connection *conn, int code) {
             conn->reply = REPLY_404;
             conn->reply_len = sizeof(REPLY_404)-1;
             break;
+        case 304:
+			conn->outheader = HEADER_304;
+			conn->outheader_len = sizeof(HEADER_304)-1;
+			conn->reply = NULL;
+			conn->reply_len = 0;
+			conn->headers_only = 1;
+			break;
         case 500:
         default:
 			conn->outheader = HEADER_500;
@@ -567,7 +575,7 @@ static int parse_ifmodsince(struct connection *conn, const char *date_str) {
 		&broken_down
 	) == NULL) return -1;
 	
-	if((result = timegm(&broken_down)) < == -1) return -1;
+	if((result = timegm(&broken_down)) == -1) return -1;
 	conn->ifmodsince = result;
 		
 	return 0;
@@ -671,23 +679,31 @@ bad_request:
 }
 
 static void serve_file(struct connection *conn) {
+	char *last_modified_str;
+	char *content_type;
+	time_t last_modified;
 	
-	DEBUG_PRINT("st_mtime = %d\n", 
-		conn->statbuf->st_mtime);
+	last_modified = conn->statbuf->st_mtime;
+		
+	if(	conn->ifmodsince != (time_t)-1 && 
+		last_modified <= conn->ifmodsince) {
+		default_reply(conn, 304);
+		DEBUG_PRINT("Sent a 304.\n");
+		return;
+	}
 	
 	/* Setting the response header */
 	char *p = conn->path;
 	while(*p)p++;
 	while(p != conn->path && *p != '.') p--;
 	
-	char *content_type;
 	if(p == conn->path) content_type = "application/octet-stream";
 	else content_type = mime_lookup(p);
 	
-	char *last_modified_str;
-	if((last_modified_str = get_lastmodstr(conn->statbuf->st_mtime)) == NULL)  {
+	if((last_modified_str = get_lastmodstr(last_modified)) == NULL)  {
 		default_reply(conn, 500); return; 
 	}
+	
 	conn->outheader_len = asprintf(&conn->outheader,
 		"HTTP/1.1 200 OK\r\n"
 		"Connection: close\r\n"
