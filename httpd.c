@@ -24,6 +24,7 @@
 #define HEADER_500 "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n"
 
 #define HEADER_304 "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n"
+#define HEADER_416 "HTTP/1.1 416 Range Not Satisfiable\r\nConnection: close\r\n\r\n"
 
 #ifndef NO_IPV6 /* TODO: Add IPv6 support */
 #   define HAVE_INET6
@@ -117,6 +118,9 @@ struct connection {
     char *reply;
     size_t reply_len;
     size_t reply_sent;
+    
+    off_t ini; /* file range to serve. For implementing HTTP Ranges. */
+    off_t fin;
     
     /* Boolean. If set, reply and outheader will not be free()'ed because they are not
      * on the heap, they are default responses hardcoded in the data segment.  */
@@ -336,6 +340,8 @@ static struct connection* connection_new() {
     conn->reply = NULL;
     conn->reply_len = 0;
     conn->reply_sent = 0;
+    conn->ini = (off_t) -1;
+    conn->fin = (off_t) -1;
     
     conn->reply_fd = -1;
 
@@ -531,6 +537,13 @@ static void default_reply(struct connection *conn, int code) {
 			conn->reply_len = 0;
 			conn->headers_only = 1;
 			break;
+		case 416: /* MMmmmmm.... */
+			conn->outheader = HEADER_416;
+			conn->outheader_len = sizeof(HEADER_416)-1;
+			conn->reply = NULL;
+			conn->reply_len = 0;
+			conn->headers_only = 1;
+			break;
         case 500:
         default:
 			conn->outheader = HEADER_500;
@@ -581,6 +594,23 @@ static int parse_ifmodsince(struct connection *conn, const char *date_str) {
 	return 0;
 }
 
+static int parse_range(struct connection *conn, const char *range_str) {
+	unsigned long ini, fin;
+		
+	if(sscanf(range_str, "bytes %lu-%lu", &ini, &fin) != 2)
+		return -1;
+	//fprintf(stderr, "---> ini: %lu, fin: %lu\n", ini, fin);
+	
+	if(ini > fin) {
+		unsigned long tmp = ini; ini = fin; fin = tmp;
+	}
+	conn->ini = (off_t) ini;
+	conn->fin = (off_t) fin;
+	
+	
+	return 0;
+}
+
 static char *get_lastmodstr(time_t t) {
 #define RESULT_STR_SIZE 32
 
@@ -619,6 +649,8 @@ static int parse_field_line(struct connection *conn, const char *field_line) {
 		// TODO
 	} else if(strcmp(key, "If-Modified-Since") == 0) {
 		if(parse_ifmodsince(conn, value) < 0) return -1;
+	} else if(strcmp(key, "Range") == 0) {
+		if(parse_range(conn, value) < 0) return -1;
 	}
 	
 	return 0;
@@ -654,12 +686,14 @@ static void parse_input(struct connection *conn) {
     /* Detect HTTP/1.0 or HTTP/1.1 */
     
     const char *proto = p;
-    while(*p != '\0' && *p != '\n') p++;
+    while(*p != '\0' && *p != '\r' && *p != '\n') p++;
     *p = '\0';
-    p++;
+    p++; if(*p == '\n') p++;
+    
+    printf("-------------%s---------\n", proto);
     if(strcmp(proto, "HTTP/1.0") == 0) conn->old_http = 1;
     else if (strcmp(proto, "HTTP/1.1") == 0) conn->old_http = 0;
-    //else goto bad_request;
+    else goto bad_request;
         
     /* process header fields */
     const char *q = p;
@@ -704,12 +738,16 @@ static void serve_file(struct connection *conn) {
 		default_reply(conn, 500); return; 
 	}
 	
+	/* TODO: RANGES HERE AND IN SENDFILE */
+	
 	conn->outheader_len = asprintf(&conn->outheader,
 		"HTTP/1.1 200 OK\r\n"
 		"Connection: close\r\n"
 		"Content-Type: %s\r\n"
+		"Accept-Ranges: bytes\r\n"
 		"Content-Length: %lld\r\n"
 		"Last-Modified: %s\r\n"
+		"Cache-Control: no-cache\r\n" /* This does not disable browser caching but isntructs the browser to check with webserver. */
 		"\r\n"
 		,
 		content_type,
@@ -737,7 +775,7 @@ static void serve_directory_listing(struct connection *conn) {
 static void process_request_get(struct connection *conn) {
 	
 	const char *content_type;
-	
+    
     conn->statbuf = (struct stat*) xmalloc(sizeof(struct stat));
 
 	if(stat(conn->url, conn->statbuf) == -1) {

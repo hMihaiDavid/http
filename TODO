@@ -1,20 +1,21 @@
 Keep-Alive
+log, referer, user agent
 refactor statbuf
-refactor url path and serve file code???
 zero length files, how to deal with them? browsers think connection was reset.
-improve Time-Out
+Time-Out
 max conn/ip----no
 HTTP Ranges
 If-Modified-Since
 directory listing
-fix logfile
 man tcp TCP_CORK
 chroot
-fix client addr info
+HTTP/1.0 RESPONSES TO HTTP/1.0 AND CHECK WHAT FEATURES AVAILABLE
+fix client addr info and port
 review errorcheck on low level io
 efficiency of reply from mem
 
 tuning
+?max file sizes
 https://stackoverflow.com/questions/880557/socket-accept-too-many-open-files
 
 all about signals
