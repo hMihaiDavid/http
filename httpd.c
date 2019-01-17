@@ -49,7 +49,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <netinet/ip.h> /* superset of previous */
+#include <netinet/ip.h>
 #include <arpa/inet.h>
 #include <getopt.h>
 #include <sys/epoll.h>
@@ -61,7 +61,7 @@
 #include <time.h>
 
 /* Object representing a connection being processed.
- * Functions: connection_new(), connection_free()
+ * methods: connection_new(), connection_free()
  * */
 struct connection {
     int sock;
@@ -155,7 +155,7 @@ int listing_disabled = 0; /* boolean */
 
 /* MIME table that associates file extensions to mime type strings
  * suitable for the Content-Type header. Must be NULL-terminated.
- * Taken from https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types/Complete_list_of_MIME_types
+ * Source: https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types/Complete_list_of_MIME_types
  * */
 static const char *mime_table[] = {
 	"html htm", 	"text/html",
@@ -478,19 +478,18 @@ static struct connection *accept_connection() {
     ev->events = EPOLLIN; /* Since conn->state is RECV_REPLY we are only interested in input events by now. */
     ev->data.ptr = (void*)conn; /* so that we can identify the connection when we receive an event */
     conn->ev = ev; /* we store it here so we can free() it when the connection is destroyed */
+    /* TODO: MAYBE ALLOCATE IT STATICALLY ON THE CONN STRUCTURE?? */
 
     if(epoll_ctl(epoll_set, EPOLL_CTL_ADD, socket, ev) == -1)
         err(1,"epoll_ctl(client socket)");
     
-    /* 
-    conn->client_ip = (char *) xmalloc(INET_ADDRSTRLEN);
-    conn->client_ip = inet_ntop(AF_INET, (void*)&(client_addr.sin_addr),
-            conn->client_ip, INET_ADDRSTRLEN);
-    conn->client_port = client_addr.sin_port;
-	*/
+    /* TODO: Fill conn->client_ip string and conn->client port 
+     * using inet_ntop, support both ipv4 and v6 */
+
     open_connections++;
-    DEBUG_PRINT("Accepted connection from %s:%d\n", conn->client_ip,
+    /*DEBUG_PRINT("Accepted connection from %s:%d\n", conn->client_ip,
             conn->client_port);
+    */
     return conn;
 }
 
@@ -501,8 +500,9 @@ static void destroy_connection(struct connection *conn) {
     if(conn->sock > -1) close(conn->sock);
     if(conn->reply_fd > -1) close(conn->reply_fd);
     open_connections--;
-    DEBUG_PRINT("Connection closed %s:%d\n", conn->client_ip, 
+    /*DEBUG_PRINT("Connection closed %s:%d\n", conn->client_ip, 
             conn->client_port);
+    */
     connection_free(conn);
 }
 
@@ -582,7 +582,6 @@ static int parse_ifmodsince(struct connection *conn, const char *date_str) {
 	struct tm broken_down;
 	time_t result;
 	
-	fprintf("PARSING IFMODSINCE -->%s\n", date_str);
 	if(strptime(date_str, 
 		"%a, %d %b %Y %H:%M:%S GMT",
 		&broken_down
@@ -637,7 +636,6 @@ static int parse_field_line(struct connection *conn, const char *field_line) {
 	if(*value == '\0') return -1; /* error */
 	*value = '\0'; value++;
 	while(*value != '\0' && isspace(*value)) value++;
-	//fprintf(stderr, "\n%s-->%s\n", key, value);
 	
 	if(strcmp(key, "Host") == 0) {
 		conn->host = value;
@@ -656,10 +654,9 @@ static int parse_field_line(struct connection *conn, const char *field_line) {
 	return 0;
 }
 
-/* TODO: MAKE SURE IT'S MEMORY SAFE */
+/* TODO: MAKE SURE IT MEMORY SAFE */
 static void parse_input(struct connection *conn) {
     char *p, c;
-    fprintf(stderr, "%s\n", conn->input_buffer);
     /* parse method */
     p = conn->input_buffer;
     while(*p != '\0' && !isblank(*p)) p++;
@@ -690,7 +687,6 @@ static void parse_input(struct connection *conn) {
     *p = '\0';
     p++; if(*p == '\n') p++;
     
-    printf("-------------%s---------\n", proto);
     if(strcmp(proto, "HTTP/1.0") == 0) conn->old_http = 1;
     else if (strcmp(proto, "HTTP/1.1") == 0) conn->old_http = 0;
     else goto bad_request;
@@ -1070,11 +1066,14 @@ static void handle_signals(int sig) {
     running = 0;
 }
 
+/*
 #ifdef DEBUG
 static void handle_sigpipe(int sig) {
     fprintf(stderr, "[DEBUG] Received SIGPIPE\n");
 }
 #endif
+*/
+
 /* --- END SIGNAL HANDLING --- */
 
 int main(int argc, char **argv) {
@@ -1092,11 +1091,13 @@ int main(int argc, char **argv) {
     }
 
     /* Signal handling */
+/*
 #ifdef DEBUG
     if(signal(SIGPIPE, handle_sigpipe) == SIG_ERR)
 #else
-	if(signal(SIGPIPE, SIG_IGN) == SIG_ERR)
-#endif
+*/
+    if(signal(SIGPIPE, SIG_IGN) == SIG_ERR)
+//#endif
         err(1,"signal(SIGPIPE)");
     
     if(signal(SIGINT, handle_signals) == SIG_ERR)
@@ -1138,10 +1139,11 @@ int main(int argc, char **argv) {
     
     /* Cleanup */
     // TODO
-    if(is_parent ) printf("\nQuitting...\n");
-    close(sockserv);
-    fclose(logfile);
-
+    if(is_parent ) {
+        printf("\nQuitting...\n");
+        close(sockserv);
+        fclose(logfile);
+    }
     return 0;
 }
 
